@@ -6,6 +6,8 @@ adapter with remote peers, creating a shared virtual LAN.
 
 import socket
 import ssl
+import sys
+import os
 import threading
 import time
 import tkinter as tk
@@ -326,8 +328,38 @@ class TunnelGUI:
 
 
 # ---------------------------------------------------------------------------
+# UAC elevation helper
+# ---------------------------------------------------------------------------
+def _is_admin() -> bool:
+    """Check if running with Administrator privileges on Windows."""
+    if sys.platform != 'win32':
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def _request_elevation():
+    """Re-launch ourselves as Administrator via UAC prompt."""
+    import ctypes
+    script = os.path.abspath(sys.argv[0])
+    # ShellExecuteW returns >32 on success
+    ret = ctypes.windll.shell32.ShellExecuteW(
+        None, 'runas', sys.executable, f'"{script}"', None, 1,
+    )
+    if ret <= 32:
+        messagebox.showerror('Error', 'Failed to request Administrator privileges.')
+        sys.exit(1)
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
+    if not _is_admin():
+        _request_elevation()
     app = TunnelGUI()
     app.run()

@@ -263,13 +263,24 @@ class TAPAdapter:
     # -- IP config ----------------------------------------------------------
 
     def configure_ip(self, ip: str, mask: str = '255.255.255.0'):
-        """Configure the adapter IP address using netsh."""
+        """Configure the adapter IP address using netsh. Requires admin."""
         if not self.name:
             log.warning('Adapter name unknown, skipping IP configuration')
             return
         cmd = [
             'netsh', 'interface', 'ip', 'set', 'address',
-            self.name, 'static', ip, mask,
+            f'name={self.name}', 'static', ip, mask,
         ]
         log.info('Configuring IP: %s/%s on "%s"', ip, mask, self.name)
-        subprocess.run(cmd, check=True, capture_output=True)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
+            log.warning(
+                'Failed to configure IP (need Run as Administrator?): %s', stderr
+            )
+            raise RuntimeError(
+                f'Could not set IP on "{self.name}".\n\n'
+                'Right-click the app and select "Run as Administrator",\n'
+                'or manually set the adapter IP in Network Connections.'
+            ) from None
