@@ -23,7 +23,7 @@ echo [1/3] Installing PyInstaller...
 pip install pyinstaller >nul 2>&1
 
 echo [2/3] Building executable...
-pyinstaller --noconfirm --onefile --noconsole ^
+pyinstaller --noconfirm --onefile --noconsole --uac-admin ^
     --name LANGameTunnel ^
     --distpath dist ^
     --workpath build_tmp\work ^

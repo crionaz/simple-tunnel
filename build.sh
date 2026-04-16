@@ -61,7 +61,7 @@ docker run --rm \
         pip install --quiet pyinstaller 2>/dev/null
 
         echo "  Packaging LANGameTunnel..."
-        pyinstaller --noconfirm --onefile --noconsole \
+        pyinstaller --noconfirm --onefile --noconsole --uac-admin \
             --name LANGameTunnel \
             --distpath /src/dist \
             --workpath /tmp/build_work \

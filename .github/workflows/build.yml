@@ -21,7 +21,7 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --noconfirm --onefile --noconsole --name LANGameTunnel client.py
+          pyinstaller --noconfirm --onefile --noconsole --uac-admin --name LANGameTunnel client.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
