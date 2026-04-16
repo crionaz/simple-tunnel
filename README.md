@@ -36,18 +36,27 @@ Run `install_tap.bat` or install [OpenVPN](https://openvpn.net/community-downloa
 
 ### 3. Start the server
 
-On a machine with a public IP (or port-forwarded):
+On a VM or machine with a public IP, clone the repo and run:
 
 ```bash
-python server.py
+./setup_server.sh
 ```
 
-Options:
+This single script installs Python if needed, opens the firewall port, and starts the server.
+
+With TLS:
+```bash
+TLS=1 ./setup_server.sh
 ```
---host 0.0.0.0    Bind address (default: 0.0.0.0)
---port 21900      Port (default: 21900)
---cert FILE       TLS certificate (optional)
---key  FILE       TLS private key (optional)
+
+Custom port:
+```bash
+PORT=9000 ./setup_server.sh
+```
+
+Or run manually:
+```bash
+python server.py --port 21900
 ```
 
 ### 4. Start clients
@@ -90,18 +99,28 @@ If the connection to the server drops, the client automatically reconnects with 
 
 ## Building a Windows Executable
 
-### Option A: Build on a Linux VM (cross-compile)
+### Option A: GitHub Actions (recommended)
+
+Push to GitHub and the `.exe` is built automatically on a real Windows runner:
+
+```bash
+git push
+```
+
+Then go to the **Actions** tab → latest run → download the **LANGameTunnel-windows** artifact.
+
+### Option B: Build natively on Windows
+
+Double-click `build_windows.bat` (requires Python 3.10+ in PATH). Output: `dist/LANGameTunnel.exe`.
+
+### Option C: Build from Linux/macOS with Docker
 
 ```bash
 chmod +x build.sh
 ./build.sh
 ```
 
-This installs Wine + Windows Python, then uses PyInstaller to produce `dist/LANGameTunnel.exe`.
-
-### Option B: Build natively on Windows
-
-Double-click `build_windows.bat` (requires Python 3.10+ in PATH). Output: `dist/LANGameTunnel.exe`.
+> Note: Docker builds a Linux binary. For a true Windows `.exe`, use Option A or B.
 
 Copy the `.exe` to any Windows PC — no Python installation needed. Just make sure the TAP driver is installed.
 
@@ -109,15 +128,17 @@ Copy the `.exe` to any Windows PC — no Python installation needed. Just make s
 
 ```
 tunnel/
-├── server.py           # Relay server (run on host machine)
-├── client.py           # Client with GUI + auto-reconnect
-├── protocol.py         # Wire protocol (shared)
-├── tap_adapter.py      # Windows TAP adapter interface
-├── generate_certs.py   # TLS certificate generator
-├── build.sh            # Linux VM → Windows .exe cross-build
-├── build_windows.bat   # Native Windows build script
-├── install_tap.bat     # TAP driver install helper
-├── requirements.txt    # Python dependencies
+├── server.py              # Relay server (run on host machine)
+├── client.py              # Client with GUI + auto-reconnect
+├── protocol.py            # Wire protocol (shared)
+├── tap_adapter.py         # Windows TAP adapter interface
+├── generate_certs.py      # TLS certificate generator
+├── setup_server.sh        # One-command server setup for VMs
+├── .github/workflows/    # GitHub Actions auto-build
+├── build.sh               # Docker-based build (Linux/macOS)
+├── build_windows.bat      # Native Windows build script
+├── install_tap.bat        # TAP driver install helper
+├── requirements.txt       # Python dependencies
 └── README.md           # This file
 ```
 

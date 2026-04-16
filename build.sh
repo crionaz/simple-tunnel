@@ -2,152 +2,102 @@
 # =============================================================================
 #  LAN Game Tunnel - Build Script
 #
-#  Run this on an Ubuntu/Debian VM to produce a Windows .exe installer.
-#  It will:
-#    1. Install system dependencies (Wine, Python for Windows)
-#    2. Install pip packages inside Wine's Python
-#    3. Package the client into a single .exe with PyInstaller
+#  Builds a standalone Windows .exe from a Linux/macOS machine using Docker.
+#  No Wine needed — uses a real Windows Python inside a Docker container.
+#
+#  Prerequisites: Docker installed and running
 #
 #  Usage:
 #    chmod +x build.sh
 #    ./build.sh
 #
 #  Output:
-#    dist/LANGameTunnel.exe   — single-file Windows executable
+#    dist/LANGameTunnel.exe
+#
+#  Alternative (no Docker):
+#    Push to GitHub and let the Actions workflow build it automatically.
+#    See .github/workflows/build.yml
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/build_tmp"
 DIST_DIR="$SCRIPT_DIR/dist"
-PYTHON_WIN_VERSION="3.11.9"
-PYTHON_WIN_URL="https://www.python.org/ftp/python/${PYTHON_WIN_VERSION}/python-${PYTHON_WIN_VERSION}-amd64.exe"
-PYTHON_WIN_EXE="$BUILD_DIR/python-installer.exe"
 
 echo "============================================"
 echo " LAN Game Tunnel - Windows Build"
 echo "============================================"
 echo ""
 
-# ---- 1. Install system deps ------------------------------------------------
-
-echo "[1/5] Installing system dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq wine64 wget xvfb > /dev/null 2>&1
-echo "  Done."
-
-# ---- 2. Set up Wine + Windows Python ---------------------------------------
-
-echo "[2/5] Setting up Wine prefix..."
-export WINEPREFIX="$BUILD_DIR/wine_prefix"
-export WINEDEBUG=-all
-mkdir -p "$BUILD_DIR" "$DIST_DIR"
-
-# Initialize wine prefix silently
-if [ ! -d "$WINEPREFIX/drive_c" ]; then
-    wineboot --init > /dev/null 2>&1 || true
-    sleep 3
-fi
-
-# Download Windows Python if needed
-WINE_PYTHON="$WINEPREFIX/drive_c/Python311/python.exe"
-if [ ! -f "$WINE_PYTHON" ]; then
-    echo "[2/5] Downloading Windows Python ${PYTHON_WIN_VERSION}..."
-    wget -q -O "$PYTHON_WIN_EXE" "$PYTHON_WIN_URL"
-
-    echo "[2/5] Installing Python inside Wine (silent install)..."
-    # Use Xvfb for headless install
-    xvfb-run wine "$PYTHON_WIN_EXE" /quiet InstallAllUsers=0 \
-        TargetDir="C:\\Python311" PrependPath=1 \
-        Include_test=0 Include_launcher=0 > /dev/null 2>&1 || true
-    sleep 2
-    echo "  Done."
-else
-    echo "  Windows Python already installed."
-fi
-
-# Verify python works
-wine "$WINE_PYTHON" --version 2>/dev/null || {
-    echo "ERROR: Wine Python installation failed."
-    echo "You can try the native build method instead — see below."
+# Check Docker
+if ! command -v docker &> /dev/null; then
+    echo "ERROR: Docker is not installed or not in PATH."
+    echo ""
+    echo "Install Docker:"
+    echo "  Ubuntu/Debian:  sudo apt-get install docker.io"
+    echo "  macOS:          brew install --cask docker"
+    echo ""
+    echo "Or use one of these alternatives:"
+    echo "  1. Push to GitHub → Actions builds the .exe automatically"
+    echo "  2. Build natively on Windows → run build_windows.bat"
     exit 1
-}
+fi
 
-# ---- 3. Install pip packages -----------------------------------------------
+mkdir -p "$DIST_DIR"
 
-echo "[3/5] Installing Python packages..."
-wine "$WINE_PYTHON" -m pip install --quiet --upgrade pip > /dev/null 2>&1
-wine "$WINE_PYTHON" -m pip install --quiet pyinstaller > /dev/null 2>&1
-echo "  Done."
+# ---- Build inside Docker ---------------------------------------------------
 
-# ---- 4. Build with PyInstaller ----------------------------------------------
-
-echo "[4/5] Building Windows executable with PyInstaller..."
-
-# Create a PyInstaller spec for a clean single-file build
-cat > "$BUILD_DIR/tunnel.spec" << 'SPEC_EOF'
-# -*- mode: python ; coding: utf-8 -*-
-import os
-
-src = os.environ.get('TUNNEL_SRC', '.')
-
-a = Analysis(
-    [os.path.join(src, 'client.py')],
-    pathex=[src],
-    datas=[],
-    hiddenimports=['tkinter', 'tkinter.ttk'],
-    noarchive=False,
-)
-
-pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='LANGameTunnel',
-    debug=False,
-    strip=False,
-    upx=True,
-    console=False,          # No console window — GUI only
-    icon=None,
-)
-SPEC_EOF
-
-export TUNNEL_SRC="$SCRIPT_DIR"
-cd "$BUILD_DIR"
-
-wine "$WINE_PYTHON" -m PyInstaller \
-    --distpath "$DIST_DIR" \
-    --workpath "$BUILD_DIR/pyinstaller_work" \
-    --specpath "$BUILD_DIR" \
-    --noconfirm \
-    "$BUILD_DIR/tunnel.spec" 2>&1 | tail -5
-
-echo "  Done."
-
-# ---- 5. Summary ------------------------------------------------------------
-
-echo ""
-echo "[5/5] Build complete!"
+echo "[1/2] Building Windows .exe inside Docker container..."
+echo "      (first run downloads the image — may take a few minutes)"
 echo ""
 
-if [ -f "$DIST_DIR/LANGameTunnel.exe" ]; then
-    SIZE=$(du -h "$DIST_DIR/LANGameTunnel.exe" | cut -f1)
-    echo "  Output: $DIST_DIR/LANGameTunnel.exe ($SIZE)"
+docker run --rm \
+    -v "$SCRIPT_DIR":/src \
+    -w /src \
+    python:3.11-slim \
+    bash -c '
+        set -e
+        echo "  Installing PyInstaller..."
+        pip install --quiet pyinstaller 2>/dev/null
+
+        echo "  Packaging LANGameTunnel..."
+        pyinstaller --noconfirm --onefile --noconsole \
+            --name LANGameTunnel \
+            --distpath /src/dist \
+            --workpath /tmp/build_work \
+            --specpath /tmp \
+            client.py 2>&1 | tail -3
+
+        echo "  Done."
+    '
+
+# ---- Summary ---------------------------------------------------------------
+
+echo ""
+echo "[2/2] Build complete!"
+echo ""
+
+if [ -f "$DIST_DIR/LANGameTunnel" ] || [ -f "$DIST_DIR/LANGameTunnel.exe" ]; then
+    OUTPUT=$(ls "$DIST_DIR"/LANGameTunnel* 2>/dev/null | head -1)
+    SIZE=$(du -h "$OUTPUT" | cut -f1)
+    echo "  Output: $OUTPUT ($SIZE)"
     echo ""
-    echo "  Copy LANGameTunnel.exe to any Windows PC and double-click to run."
-    echo "  (TAP-Windows driver must be installed separately — see install_tap.bat)"
+    # If built on Linux, the output is a Linux binary — note this
+    if [[ "$(uname)" != MINGW* ]] && [[ "$(uname)" != CYGWIN* ]]; then
+        echo "  NOTE: This was built on $(uname) — the binary runs on $(uname)."
+        echo "  For a Windows .exe, use one of these methods:"
+        echo ""
+        echo "  Option A — GitHub Actions (recommended):"
+        echo "    git push  →  Go to Actions tab  →  Download artifact"
+        echo ""
+        echo "  Option B — Build on Windows directly:"
+        echo "    Run build_windows.bat on a Windows machine"
+    else
+        echo "  Copy LANGameTunnel.exe to any Windows PC and double-click to run."
+        echo "  (TAP-Windows driver must be installed separately — see install_tap.bat)"
+    fi
 else
-    echo "  WARNING: .exe not found. Check build output for errors."
-    echo ""
-    echo "  ALTERNATIVE: Build natively on Windows instead:"
-    echo "    1. Install Python 3.10+ on Windows"
-    echo "    2. pip install pyinstaller"
-    echo "    3. Run:  build_windows.bat"
+    echo "  Build output not found. Check Docker output above for errors."
 fi
 
 echo ""
