@@ -54,6 +54,8 @@ class TunnelClient:
         self._use_tls: bool = False
         self._reconnect_count: int = 0
         self._lock = threading.Lock()
+        self._connected_at: float = 0  # time.monotonic() of last connect
+        self._on_error = None          # callback(str) for fatal errors
 
     def connect(self, host: str, port: int, name: str, ip_addr: str, use_tls: bool = False):
         """Connect to the relay server."""
@@ -82,6 +84,7 @@ class TunnelClient:
             self.sock.connect((host, port))
 
         self.sock.settimeout(None)
+        self._connected_at = time.monotonic()
         hello = json.dumps({'name': name, 'ip': ip_addr}).encode('utf-8')
         self.sock.sendall(pack_message(MSG_HELLO, hello))
         log.info('Connected to %s:%d', host, port)
@@ -171,9 +174,25 @@ class TunnelClient:
             except (ConnectionError, OSError):
                 if not self.running:
                     break
-                log.error('Server connection lost')
-                self._set_status('Connection lost')
+                elapsed = time.monotonic() - self._connected_at
+                log.error('Server connection lost after %.1fs', elapsed)
                 self._close_socket()
+                # If connection dropped within 3s, likely a TLS mismatch
+                if elapsed < 3:
+                    self._reconnect_count += 1
+                    if self._reconnect_count >= 2:
+                        tls_hint = (
+                            'Connection keeps dropping immediately.\n\n'
+                            'The server likely expects TLS but the client is not using it '
+                            '(or vice versa).\n\n'
+                            'Check the "Use TLS encryption" checkbox matches the server config.'
+                        )
+                        self._set_status('TLS mismatch?')
+                        if self._on_error:
+                            self._on_error(tls_hint)
+                        self.running = False
+                        break
+                self._set_status('Connection lost')
                 if not self._reconnect():
                     break
             except Exception:
@@ -389,6 +408,9 @@ class TunnelGUI:
                 self.client = TunnelClient(
                     on_status=status_callback,
                     on_peers=self._update_peers,
+                )
+                self.client._on_error = lambda msg: self.root.after(
+                    0, lambda m=msg: self._on_error(m)
                 )
                 self.client.start(host, port, name, ip_addr, self.tls_var.get())
                 self.root.after(0, self._on_connected)
