@@ -12,7 +12,7 @@ import argparse
 
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT, MAX_FRAME_SIZE,
-    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE, MSG_PEERS,
+    MSG_DATA, MSG_HELLO, MSG_INFO, MSG_KEEPALIVE, MSG_PEERS, MSG_QUERY,
     pack_message, unpack_header,
 )
 
@@ -135,11 +135,22 @@ class TunnelServer:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         name = payload.decode('utf-8', errors='replace')
                         vip = ''
+                    # Check for duplicate virtual IP
+                    if vip and self._is_ip_taken(vip, exclude_cid=cid):
+                        err = json.dumps({'error': f'IP {vip} is already taken by another player.'}).encode()
+                        writer.write(pack_message(MSG_INFO, err))
+                        await writer.drain()
+                        log.warning('Rejected %s: duplicate IP %s', addr, vip)
+                        break
                     self.client_names[cid] = name
                     if vip:
                         self.client_ips[cid] = vip
                     log.info('Client %s identified as "%s" (IP: %s)', addr, name, vip or 'unknown')
                     await self._broadcast_peers()
+                elif msg_type == MSG_QUERY:
+                    # Return peer list without joining
+                    await self._send_peers_to(writer)
+                    break
                 elif msg_type == MSG_KEEPALIVE:
                     writer.write(pack_message(MSG_KEEPALIVE))
                     await writer.drain()
@@ -173,6 +184,28 @@ class TunnelServer:
         for cid in dead:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
+
+    def _is_ip_taken(self, ip: str, exclude_cid: int = None) -> bool:
+        """Check if a virtual IP is already assigned to another client."""
+        for cid, vip in self.client_ips.items():
+            if cid != exclude_cid and vip == ip:
+                return True
+        return False
+
+    async def _send_peers_to(self, writer):
+        """Send current peer list to a single writer."""
+        peers = []
+        for cid in self.clients:
+            peers.append({
+                'name': self.client_names.get(cid, '?'),
+                'ip': self.client_ips.get(cid, ''),
+            })
+        msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))
+        try:
+            writer.write(msg)
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
 
     async def _broadcast_peers(self):
         """Send current peer list to all clients."""

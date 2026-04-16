@@ -17,7 +17,7 @@ import logging
 
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT,
-    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE, MSG_PEERS,
+    MSG_DATA, MSG_HELLO, MSG_INFO, MSG_KEEPALIVE, MSG_PEERS, MSG_QUERY,
     pack_message, unpack_header,
 )
 from tap_adapter import TAPAdapter
@@ -169,6 +169,19 @@ class TunnelClient:
                             self._on_peers(peers)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
+                elif msg_type == MSG_INFO:
+                    try:
+                        info = json.loads(payload)
+                        err_msg = info.get('error', '')
+                        if err_msg:
+                            log.error('Server error: %s', err_msg)
+                            self._set_status('Rejected')
+                            if self._on_error:
+                                self._on_error(err_msg)
+                            self.running = False
+                            break
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
                 elif msg_type == MSG_KEEPALIVE:
                     pass  # server pong, ignore
             except (ConnectionError, OSError):
@@ -238,6 +251,69 @@ class TunnelClient:
             t.join(timeout=0.5)
         self._threads.clear()
         log.info('Client stopped')
+
+
+# ---------------------------------------------------------------------------
+# Query peers without joining
+# ---------------------------------------------------------------------------
+def query_peers(host: str, port: int, use_tls: bool = False) -> list[dict]:
+    """Open a temporary connection, send MSG_QUERY, get peer list, close."""
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    raw.settimeout(5)
+    try:
+        if use_tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(raw)
+        else:
+            sock = raw
+        sock.connect((host, port))
+        sock.sendall(pack_message(MSG_QUERY, b''))
+        # Read MSG_PEERS response
+        header = b''
+        while len(header) < HEADER_SIZE:
+            chunk = sock.recv(HEADER_SIZE - len(header))
+            if not chunk:
+                return []
+            header += chunk
+        length, msg_type = unpack_header(header)
+        payload = b''
+        while len(payload) < length:
+            chunk = sock.recv(length - len(payload))
+            if not chunk:
+                return []
+            payload += chunk
+        if msg_type == MSG_PEERS:
+            return json.loads(payload)
+        return []
+    except Exception as e:
+        log.warning('query_peers failed: %s', e)
+        raise
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
+def _suggest_ip(peers: list[dict]) -> str:
+    """Suggest the next available IP in 10.10.0.x range."""
+    taken = set()
+    for p in peers:
+        ip = p.get('ip', '')
+        parts = ip.split('.')
+        if len(parts) == 4 and parts[0] == '10' and parts[1] == '10' and parts[2] == '0':
+            try:
+                taken.add(int(parts[3]))
+            except ValueError:
+                pass
+    for i in range(1, 255):
+        if i not in taken:
+            return f'10.10.0.{i}'
+    return '10.10.0.1'
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +393,9 @@ class TunnelGUI:
         btn = ttk.Frame(main)
         btn.pack(fill=tk.X, pady=8)
 
+        self.refresh_btn = ttk.Button(btn, text='Refresh Peers', command=self._on_refresh)
+        self.refresh_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
+
         self.connect_btn = ttk.Button(btn, text='Connect', command=self._on_connect)
         self.connect_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
 
@@ -377,6 +456,41 @@ class TunnelGUI:
         self.root.after(0, _do)
 
     # -- actions ------------------------------------------------------------
+
+    def _on_refresh(self):
+        """Query the server for connected peers without joining."""
+        host = self.host_var.get().strip()
+        if not host:
+            messagebox.showerror('Error', 'Server address is required')
+            return
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            messagebox.showerror('Error', 'Invalid port number')
+            return
+
+        self.refresh_btn.config(state=tk.DISABLED)
+        self.status_var.set('Querying...')
+
+        def do_query():
+            try:
+                peers = query_peers(host, port, self.tls_var.get())
+                suggested = _suggest_ip(peers)
+                def update():
+                    self._update_peers(peers)
+                    self.ip_var.set(suggested)
+                    self.status_var.set(f'{len(peers)} peer(s) online')
+                    self.refresh_btn.config(state=tk.NORMAL)
+                self.root.after(0, update)
+            except Exception as e:
+                err = str(e)
+                def show_err():
+                    self.status_var.set('Query failed')
+                    self.refresh_btn.config(state=tk.NORMAL)
+                    messagebox.showerror('Error', f'Could not reach server:\n{err}')
+                self.root.after(0, show_err)
+
+        threading.Thread(target=do_query, daemon=True).start()
 
     def _on_connect(self):
         host = self.host_var.get().strip()
