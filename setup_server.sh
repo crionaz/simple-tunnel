@@ -66,7 +66,19 @@ CERT_ARGS=""
 if [ "$TLS" = "1" ]; then
     echo "[3/4] Setting up TLS..."
     if [ ! -f "$SCRIPT_DIR/server.crt" ] || [ ! -f "$SCRIPT_DIR/server.key" ]; then
-        pip3 install --quiet cryptography 2>/dev/null || pip install --quiet cryptography 2>/dev/null
+        # Install cryptography — try system package first (avoids PEP 668 issues),
+        # fall back to pip with --break-system-packages for newer distros
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get install -y -qq python3-cryptography > /dev/null 2>&1 || true
+        fi
+        # Check if it imported successfully, if not try pip
+        if ! python3 -c "import cryptography" 2>/dev/null; then
+            pip3 install --break-system-packages --quiet cryptography 2>/dev/null \
+                || pip3 install --quiet cryptography 2>/dev/null \
+                || pip install --quiet cryptography 2>/dev/null \
+                || { echo "  ERROR: Could not install cryptography. Install manually:"; \
+                     echo "    sudo apt-get install python3-cryptography"; exit 1; }
+        fi
         cd "$SCRIPT_DIR"
         python3 generate_certs.py
     else
