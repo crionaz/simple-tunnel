@@ -6,20 +6,26 @@
 #  It installs Python if needed, opens the firewall port, and starts serving.
 #
 #  Usage:
-#    curl -sSL <your-raw-url>/setup_server.sh | bash
-#    # or
 #    chmod +x setup_server.sh
-#    ./setup_server.sh
+#    ./setup_server.sh            # install as service & start
+#    ./setup_server.sh --fg       # run in foreground instead
 #
 #  Options (environment variables):
 #    PORT=21900          Server port (default: 21900)
 #    TLS=1               Enable TLS (auto-generates certs if missing)
+#
+#  Service management (after install):
+#    sudo systemctl status  lan-tunnel
+#    sudo systemctl stop    lan-tunnel
+#    sudo systemctl restart lan-tunnel
+#    sudo journalctl -u lan-tunnel -f     # live logs
 # =============================================================================
 
 set -euo pipefail
 
 PORT="${PORT:-21900}"
 TLS="${TLS:-0}"
+FG_MODE="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "============================================"
@@ -91,13 +97,58 @@ fi
 
 # ---- 4. Start server ------------------------------------------------------
 
-echo "[4/4] Starting server on port $PORT..."
-echo ""
-echo "  Players connect to:  <your-vm-ip>:$PORT"
-echo "  Press Ctrl+C to stop"
+cd "$SCRIPT_DIR"
+
+if [ "$FG_MODE" = "--fg" ]; then
+    echo "[4/4] Starting server in foreground on port $PORT..."
+    echo ""
+    echo "  Players connect to:  <your-vm-ip>:$PORT"
+    echo "  Press Ctrl+C to stop"
+    echo ""
+    echo "============================================"
+    echo ""
+    exec python3 server.py --port "$PORT" $CERT_ARGS
+fi
+
+# ---- Install as systemd service (runs in background, survives reboot) ------
+
+echo "[4/4] Installing as background service..."
+
+SERVICE_NAME="lan-tunnel"
+PYTHON_PATH="$(command -v python3)"
+
+sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null << EOF
+[Unit]
+Description=LAN Game Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$PYTHON_PATH $SCRIPT_DIR/server.py --port $PORT $CERT_ARGS
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+sudo systemctl restart "$SERVICE_NAME"
+
 echo ""
 echo "============================================"
+echo " Server is running in background!"
+echo "============================================"
 echo ""
-
-cd "$SCRIPT_DIR"
-exec python3 server.py --port "$PORT" $CERT_ARGS
+echo "  Players connect to:  <your-vm-ip>:$PORT"
+echo ""
+echo "  Useful commands:"
+echo "    sudo systemctl status  $SERVICE_NAME   # check status"
+echo "    sudo systemctl stop    $SERVICE_NAME   # stop server"
+echo "    sudo systemctl restart $SERVICE_NAME   # restart server"
+echo "    sudo journalctl -u $SERVICE_NAME -f    # live logs"
+echo ""
+echo "  Server auto-starts on boot and restarts on crash."
+echo "============================================"
