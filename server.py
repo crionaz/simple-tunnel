@@ -5,13 +5,14 @@ Ethernet frames between them, creating a virtual LAN.
 """
 
 import asyncio
+import json
 import ssl
 import logging
 import argparse
 
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT, MAX_FRAME_SIZE,
-    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE,
+    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE, MSG_PEERS,
     pack_message, unpack_header,
 )
 
@@ -28,6 +29,7 @@ class TunnelServer:
         self.port = port
         self.clients: dict[int, asyncio.StreamWriter] = {}
         self.client_names: dict[int, str] = {}
+        self.client_ips: dict[int, str] = {}  # virtual IPs
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
@@ -51,10 +53,19 @@ class TunnelServer:
                 if msg_type == MSG_DATA:
                     await self._broadcast(cid, payload)
                 elif msg_type == MSG_HELLO:
-                    name = payload.decode('utf-8', errors='replace')
+                    # Support both legacy plain-text and new JSON format
+                    try:
+                        info = json.loads(payload)
+                        name = info.get('name', str(addr))
+                        vip = info.get('ip', '')
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        name = payload.decode('utf-8', errors='replace')
+                        vip = ''
                     self.client_names[cid] = name
-                    log.info('Client %s identified as "%s"', addr, name)
-                    self._notify_peers()
+                    if vip:
+                        self.client_ips[cid] = vip
+                    log.info('Client %s identified as "%s" (IP: %s)', addr, name, vip or 'unknown')
+                    await self._broadcast_peers()
                 elif msg_type == MSG_KEEPALIVE:
                     writer.write(pack_message(MSG_KEEPALIVE))
                     await writer.drain()
@@ -64,13 +75,14 @@ class TunnelServer:
         finally:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
+            self.client_ips.pop(cid, None)
             try:
                 writer.close()
                 await writer.wait_closed()
             except OSError:
                 pass
             log.info('Client disconnected: %s', addr)
-            self._notify_peers()
+            await self._broadcast_peers()
 
     async def _broadcast(self, sender_id: int, frame: bytes):
         """Send an Ethernet frame to all clients except the sender."""
@@ -88,10 +100,27 @@ class TunnelServer:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
 
-    def _notify_peers(self):
-        """Log current peer count."""
-        count = len(self.clients)
-        log.info('Connected peers: %d', count)
+    async def _broadcast_peers(self):
+        """Send current peer list to all clients."""
+        peers = []
+        for cid in self.clients:
+            peers.append({
+                'name': self.client_names.get(cid, '?'),
+                'ip': self.client_ips.get(cid, ''),
+            })
+        log.info('Connected peers: %d', len(peers))
+        msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))
+        dead = []
+        for cid, writer in self.clients.items():
+            try:
+                writer.write(msg)
+                await writer.drain()
+            except (ConnectionError, OSError):
+                dead.append(cid)
+        for cid in dead:
+            self.clients.pop(cid, None)
+            self.client_names.pop(cid, None)
+            self.client_ips.pop(cid, None)
 
     async def start(self, certfile: str = None, keyfile: str = None):
         ssl_ctx = None

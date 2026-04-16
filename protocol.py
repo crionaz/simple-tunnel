@@ -4,9 +4,10 @@ import struct
 
 # Message types
 MSG_DATA = 0x01       # Ethernet frame
-MSG_HELLO = 0x02      # Client identification
+MSG_HELLO = 0x02      # Client identification (payload: JSON {"name": ..., "ip": ...})
 MSG_INFO = 0x03       # Server info/status
 MSG_KEEPALIVE = 0x04  # Keepalive
+MSG_PEERS = 0x05      # Peer list broadcast (payload: JSON list of {"name":..,"ip":..})
 
 # Header: 4-byte payload length (big-endian) + 1-byte message type
 HEADER_FMT = '!IB'

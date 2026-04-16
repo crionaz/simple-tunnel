@@ -4,6 +4,7 @@ Connects to the relay server and bridges the local TAP virtual
 adapter with remote peers, creating a shared virtual LAN.
 """
 
+import json
 import socket
 import ssl
 import sys
@@ -16,7 +17,7 @@ import logging
 
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT,
-    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE,
+    MSG_DATA, MSG_HELLO, MSG_KEEPALIVE, MSG_PEERS,
     pack_message, unpack_header,
 )
 from tap_adapter import TAPAdapter
@@ -27,6 +28,10 @@ logging.basicConfig(
 )
 log = logging.getLogger('tunnel-client')
 
+# Config file location (next to the executable / script)
+_CONFIG_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+_CONFIG_FILE = os.path.join(_CONFIG_DIR, 'tunnel_config.json')
+
 
 # ---------------------------------------------------------------------------
 # Network client
@@ -34,12 +39,13 @@ log = logging.getLogger('tunnel-client')
 class TunnelClient:
     RECONNECT_DELAYS = [1, 2, 5, 10, 15, 30]  # seconds, escalating backoff
 
-    def __init__(self, on_status=None):
+    def __init__(self, on_status=None, on_peers=None):
         self.sock: socket.socket | None = None
         self.tap: TAPAdapter | None = None
         self.running = False
         self._threads: list[threading.Thread] = []
         self._on_status = on_status  # callback(str)
+        self._on_peers = on_peers    # callback(list[dict])
         # Stored for reconnection
         self._host: str = ''
         self._port: int = DEFAULT_PORT
@@ -49,22 +55,35 @@ class TunnelClient:
         self._reconnect_count: int = 0
         self._lock = threading.Lock()
 
-    def connect(self, host: str, port: int, name: str, use_tls: bool = False):
+    def connect(self, host: str, port: int, name: str, ip_addr: str, use_tls: bool = False):
         """Connect to the relay server."""
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        raw.settimeout(5)
 
         if use_tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            self.sock = ctx.wrap_socket(raw)
+            try:
+                self.sock = ctx.wrap_socket(raw)
+                self.sock.connect((host, port))
+            except ssl.SSLError as e:
+                raw.close()
+                raise ConnectionError(
+                    f'TLS handshake failed.\n\n'
+                    f'Make sure the server is running with TLS enabled:\n'
+                    f'  TLS=1 bash setup_server.sh\n\n'
+                    f'Detail: {e}'
+                ) from None
         else:
             self.sock = raw
+            self.sock.connect((host, port))
 
-        self.sock.connect((host, port))
-        self.sock.sendall(pack_message(MSG_HELLO, name.encode('utf-8')))
+        self.sock.settimeout(None)
+        hello = json.dumps({'name': name, 'ip': ip_addr}).encode('utf-8')
+        self.sock.sendall(pack_message(MSG_HELLO, hello))
         log.info('Connected to %s:%d', host, port)
 
     def _recv_exact(self, n: int) -> bytes:
@@ -102,7 +121,7 @@ class TunnelClient:
                 time.sleep(0.1)
             try:
                 self._close_socket()
-                self.connect(self._host, self._port, self._name, self._use_tls)
+                self.connect(self._host, self._port, self._name, self._ip_addr, self._use_tls)
                 self._reconnect_count = 0
                 self._set_status(f'Reconnected to {self._host}:{self._port}')
                 return True
@@ -140,6 +159,13 @@ class TunnelClient:
 
                 if msg_type == MSG_DATA and self.tap:
                     self.tap.write(payload)
+                elif msg_type == MSG_PEERS:
+                    try:
+                        peers = json.loads(payload)
+                        if self._on_peers:
+                            self._on_peers(peers)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
                 elif msg_type == MSG_KEEPALIVE:
                     pass  # server pong, ignore
             except (ConnectionError, OSError):
@@ -170,7 +196,7 @@ class TunnelClient:
         self.tap.open()
         self.tap.configure_ip(ip_addr)
 
-        self.connect(host, port, name, use_tls)
+        self.connect(host, port, name, ip_addr, use_tls)
         self.running = True
 
         t1 = threading.Thread(target=self._tap_to_server, daemon=True, name='tap→srv')
@@ -190,9 +216,28 @@ class TunnelClient:
                 pass
             self.tap = None
         for t in self._threads:
-            t.join(timeout=3)
+            t.join(timeout=0.5)
         self._threads.clear()
         log.info('Client stopped')
+
+
+# ---------------------------------------------------------------------------
+# Config persistence
+# ---------------------------------------------------------------------------
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_config(cfg: dict):
+    try:
+        with open(_CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        log.warning('Could not save config to %s', _CONFIG_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +247,12 @@ class TunnelGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('LAN Game Tunnel')
-        self.root.geometry('420x400')
+        self.root.geometry('420x520')
         self.root.resizable(False, False)
 
         self.client: TunnelClient | None = None
         self._build_ui()
+        self._load_saved_config()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     def _build_ui(self):
@@ -250,7 +296,7 @@ class TunnelGUI:
 
         # -- Buttons ---------------------------------------------------------
         btn = ttk.Frame(main)
-        btn.pack(fill=tk.X, pady=12)
+        btn.pack(fill=tk.X, pady=8)
 
         self.connect_btn = ttk.Button(btn, text='Connect', command=self._on_connect)
         self.connect_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
@@ -260,7 +306,56 @@ class TunnelGUI:
 
         # -- Status ----------------------------------------------------------
         self.status_var = tk.StringVar(value='Disconnected')
-        ttk.Label(main, textvariable=self.status_var, style='Status.TLabel').pack(pady=5)
+        ttk.Label(main, textvariable=self.status_var, style='Status.TLabel').pack(pady=(5, 2))
+
+        # -- Peers list ------------------------------------------------------
+        peers_frame = ttk.LabelFrame(main, text='Connected Peers', padding=5)
+        peers_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.peers_text = tk.Text(peers_frame, height=5, width=45, state=tk.DISABLED,
+                                  font=('Consolas', 9), bg='#f5f5f5', relief=tk.FLAT)
+        self.peers_text.pack(fill=tk.BOTH, expand=True)
+
+    # -- config persistence ------------------------------------------------
+
+    def _load_saved_config(self):
+        cfg = _load_config()
+        if cfg.get('host'):
+            self.host_var.set(cfg['host'])
+        if cfg.get('port'):
+            self.port_var.set(str(cfg['port']))
+        if cfg.get('name'):
+            self.name_var.set(cfg['name'])
+        if cfg.get('ip'):
+            self.ip_var.set(cfg['ip'])
+        if cfg.get('tls') is not None:
+            self.tls_var.set(cfg['tls'])
+
+    def _save_current_config(self):
+        _save_config({
+            'host': self.host_var.get().strip(),
+            'port': self.port_var.get().strip(),
+            'name': self.name_var.get().strip(),
+            'ip': self.ip_var.get().strip(),
+            'tls': self.tls_var.get(),
+        })
+
+    # -- peer list display -------------------------------------------------
+
+    def _update_peers(self, peers: list):
+        """Update the peers text box (called from any thread)."""
+        def _do():
+            self.peers_text.config(state=tk.NORMAL)
+            self.peers_text.delete('1.0', tk.END)
+            if not peers:
+                self.peers_text.insert(tk.END, '  No peers connected')
+            else:
+                for p in peers:
+                    ip = p.get('ip', '?')
+                    name = p.get('name', '?')
+                    self.peers_text.insert(tk.END, f'  {ip:16s} {name}\n')
+            self.peers_text.config(state=tk.DISABLED)
+        self.root.after(0, _do)
 
     # -- actions ------------------------------------------------------------
 
@@ -282,6 +377,7 @@ class TunnelGUI:
             messagebox.showerror('Error', 'Virtual IP is required')
             return
 
+        self._save_current_config()
         self.connect_btn.config(state=tk.DISABLED)
         self.status_var.set('Connecting...')
 
@@ -290,7 +386,10 @@ class TunnelGUI:
 
         def do_connect():
             try:
-                self.client = TunnelClient(on_status=status_callback)
+                self.client = TunnelClient(
+                    on_status=status_callback,
+                    on_peers=self._update_peers,
+                )
                 self.client.start(host, port, name, ip_addr, self.tls_var.get())
                 self.root.after(0, self._on_connected)
             except Exception as e:
@@ -304,10 +403,16 @@ class TunnelGUI:
         self.status_var.set(f'Connected to {self.host_var.get()}:{self.port_var.get()}')
 
     def _on_disconnect(self):
-        if self.client:
-            self.client.stop()
-            self.client = None
-        self._reset_ui()
+        self.disconnect_btn.config(state=tk.DISABLED)
+        self.status_var.set('Disconnecting...')
+
+        def do_disconnect():
+            if self.client:
+                self.client.stop()
+                self.client = None
+            self.root.after(0, self._reset_ui)
+
+        threading.Thread(target=do_disconnect, daemon=True).start()
 
     def _on_error(self, msg: str):
         messagebox.showerror('Connection Error', msg)
@@ -317,11 +422,15 @@ class TunnelGUI:
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         self.status_var.set('Disconnected')
+        self._update_peers([])
 
     def _on_close(self):
-        if self.client:
-            self.client.stop()
-        self.root.destroy()
+        def do_close():
+            if self.client:
+                self.client.stop()
+            self.root.after(0, self.root.destroy)
+
+        threading.Thread(target=do_close, daemon=True).start()
 
     def run(self):
         self.root.mainloop()
