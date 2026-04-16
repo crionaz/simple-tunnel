@@ -284,7 +284,7 @@ class TunnelGUI:
         self.status_var.set('Connecting...')
 
         def status_callback(msg: str):
-            self.root.after(0, lambda: self.status_var.set(msg))
+            self.root.after(0, lambda m=msg: self.status_var.set(m))
 
         def do_connect():
             try:
@@ -292,7 +292,8 @@ class TunnelGUI:
                 self.client.start(host, port, name, ip_addr, self.tls_var.get())
                 self.root.after(0, self._on_connected)
             except Exception as e:
-                self.root.after(0, lambda: self._on_error(str(e)))
+                err = str(e)
+                self.root.after(0, lambda err=err: self._on_error(err))
 
         threading.Thread(target=do_connect, daemon=True).start()
 
