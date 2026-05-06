@@ -233,6 +233,8 @@ class WintunAdapter:
         ps_script = (
             "$ErrorActionPreference = 'Stop';"
             f"$guid = '{guid}';"
+            f"$ip = '{ip}';"
+            f"$prefix = {prefix};"
             "$adapter = $null;"
             # Wait up to 10s for the adapter to surface in TCP/IP stack
             "for ($i=0; $i -lt 40; $i++) {"
@@ -245,11 +247,24 @@ class WintunAdapter:
             "$alias = $adapter.Name;"
             # Bring it up
             "try { Enable-NetAdapter -InputObject $adapter -Confirm:$false -ErrorAction SilentlyContinue } catch {};"
-            # Wipe old IPs/routes so re-runs work cleanly
-            "Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;"
+            # Wipe ALL existing IPv4 addresses on our interface (clean slate)
+            "Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;"
+            # ALSO wipe this exact IP from any OTHER interface (prevents
+            # 'object already exists' when Wintun was re-created with a new ifIndex
+            # but the OS still has the old IP lingering on the dead interface)
+            "Get-NetIPAddress -IPAddress $ip -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;"
+            # And drop any leftover routes on our interface
             "Remove-NetRoute -InterfaceIndex $idx -Confirm:$false -ErrorAction SilentlyContinue | Out-Null;"
-            # Assign the static IP
-            f"New-NetIPAddress -InterfaceIndex $idx -IPAddress '{ip}' -PrefixLength {prefix} -ErrorAction Stop | Out-Null;"
+            # Assign the static IP — tolerate 'already exists' (race with previous run)
+            "try {"
+            "  New-NetIPAddress -InterfaceIndex $idx -IPAddress $ip -PrefixLength $prefix -ErrorAction Stop | Out-Null"
+            "} catch {"
+            # If it failed, check whether it's actually already configured correctly
+            "  $existing = Get-NetIPAddress -InterfaceIndex $idx -IPAddress $ip -AddressFamily IPv4 -ErrorAction SilentlyContinue;"
+            "  if (-not $existing) { throw }"
+            "};"
             # Force lowest metric so LAN broadcasts route through the tunnel
             "Set-NetIPInterface -InterfaceIndex $idx -InterfaceMetric 1 -ErrorAction SilentlyContinue;"
             # Mark Private profile so Windows Firewall is permissive
