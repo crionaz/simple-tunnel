@@ -1,0 +1,137 @@
+=== My virtual IP: 10.10.0.1    TAP: OpenVPN TAP-Windows6 ===
+
+=== ICMP PING (raw output) ===
+
+--- ping 10.10.0.3 (bhai) ---
+
+Pinging 10.10.0.3 from 10.10.0.1 with 32 bytes of data:
+Request timed out.
+Request timed out.
+Request timed out.
+Request timed out.
+
+Ping statistics for 10.10.0.3:
+    Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),
+
+
+=== Tunnel frame activity during ping ===
+  TAP -> server: 13 frames sent
+  server -> TAP: 25 frames received
+  Interpretation:
+    - 13=0  : ICMP echo never reached the TAP read side (Windows did not transmit; route or admin issue)
+    - 13>0, 25=0  : we sent but peer never replied (peer firewall blocking, or peer not connected)
+    - both >0   : tunnel works; reply was dropped at our side (should have shown Reply from)
+
+=== ARP table for virtual subnet ===
+  Interface: 10.10.0.1 --- 0xa
+  10.10.0.3             00-ff-b9-45-b4-44     dynamic
+  10.10.0.255           ff-ff-ff-ff-ff-ff     static
+  Interface: 192.168.0.95 --- 0x17
+
+=== Routes for 10.10.0.0/24 ===
+  Network Destination        Netmask          Gateway       Interface  Metric
+  10.10.0.0    255.255.255.0         On-link         10.10.0.1    281
+  10.10.0.1  255.255.255.255         On-link         10.10.0.1    281
+  10.10.0.255  255.255.255.255         On-link         10.10.0.1    281
+
+=== TAP adapter status ===
+
+Configuration for interface "OpenVPN TAP-Windows6"
+    DHCP enabled:                         No
+    IP Address:                           10.10.0.1
+    Subnet Prefix:                        10.10.0.0/24 (mask 255.255.255.0)
+    InterfaceMetric:                      25
+
+
+
+=== Network profile (must be Private) ===
+
+
+Name            : OpenVPN TAP-Windows6 2
+InterfaceAlias  : OpenVPN TAP-Windows6
+NetworkCategory : Private
+
+Name            : Crion_5Ghz 2
+InterfaceAlias  : Wi-Fi 2
+NetworkCategory : Private
+
+
+
+
+
+=== Windows Firewall profile state ===
+
+Domain Profile Settings: 
+----------------------------------------------------------------------
+State                                 ON
+
+Private Profile Settings: 
+----------------------------------------------------------------------
+State                                 ON
+
+Public Profile Settings: 
+----------------------------------------------------------------------
+State                                 ON
+Ok.
+
+
+
+=== Our firewall rules (LAN Game Tunnel*) ===
+
+Rule Name:                            LAN Game Tunnel
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            Out
+Profiles:                             Domain,Private,Public
+Grouping:                             
+LocalIP:                              Any
+RemoteIP:                             10.10.0.0/24
+Protocol:                             Any
+Edge traversal:                       No
+Action:                               Allow
+
+Rule Name:                            LAN Game Tunnel
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain,Private,Public
+Grouping:                             
+LocalIP:                              Any
+RemoteIP:                             10.10.0.0/24
+Protocol:                             Any
+Edge traversal:                       No
+Action:                               Allow
+Ok.
+
+
+
+Rule Name:                            LAN Game Tunnel ICMP
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain,Private,Public
+Grouping:                             
+LocalIP:                              Any
+RemoteIP:                             Any
+Protocol:                             ICMPv4
+                                      Type    Code
+                                      8       Any 
+Edge traversal:                       No
+Action:                               Allow
+Ok.
+
+
+
+=== Built-in ICMPv4 Echo Request rule ===
+
+DisplayName                                                       Enabled         Profile Action
+-----------                                                       -------         ------- ------
+Virtual Machine Monitoring (Echo Request - ICMPv4-In)               False             Any  Allow
+File and Printer Sharing (Echo Request - ICMPv4-In)                  True         Private  Allow
+File and Printer Sharing (Restrictive) (Echo Request - ICMPv4-In)   False          Domain  Allow
+File and Printer Sharing (Echo Request - ICMPv4-In)                  True          Domain  Allow
+File and Printer Sharing (Echo Request - ICMPv4-In)                  True          Public  Allow
+File and Printer Sharing (Restrictive) (Echo Request - ICMPv4-In)    True Private, Public  Allow
+
+
+

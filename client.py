@@ -63,6 +63,11 @@ class TunnelClient:
         # Frame counters
         self.frames_to_server = 0
         self.frames_from_server = 0
+        # Per-protocol frame counters (parsed from Ethernet header)
+        # Keys: 'arp', 'icmp_echo_req', 'icmp_echo_reply', 'icmp_other',
+        #       'tcp', 'udp', 'ipv6', 'other'
+        self.proto_to: dict[str, int] = {}
+        self.proto_from: dict[str, int] = {}
 
     def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False) -> str:
         """Connect to the relay server, send HELLO, return the assigned virtual IP."""
@@ -175,6 +180,38 @@ class TunnelClient:
                 log.warning('Reconnect attempt failed: %s', e)
         return False
 
+    @staticmethod
+    def _classify_frame(frame: bytes) -> str:
+        """Return short protocol tag for an Ethernet frame."""
+        if len(frame) < 14:
+            return 'other'
+        ethertype = (frame[12] << 8) | frame[13]
+        if ethertype == 0x0806:
+            return 'arp'
+        if ethertype == 0x86DD:
+            return 'ipv6'
+        if ethertype != 0x0800:
+            return 'other'
+        # IPv4
+        if len(frame) < 14 + 20:
+            return 'other'
+        ip_proto = frame[14 + 9]
+        if ip_proto == 1:  # ICMP
+            ihl = (frame[14] & 0x0F) * 4
+            icmp_off = 14 + ihl
+            if len(frame) > icmp_off:
+                t = frame[icmp_off]
+                if t == 8:
+                    return 'icmp_echo_req'
+                if t == 0:
+                    return 'icmp_echo_reply'
+            return 'icmp_other'
+        if ip_proto == 6:
+            return 'tcp'
+        if ip_proto == 17:
+            return 'udp'
+        return 'other'
+
     def _tap_to_server(self):
         """Read Ethernet frames from TAP and send to server."""
         while self.running:
@@ -185,6 +222,8 @@ class TunnelClient:
                         if self.sock:
                             self.sock.sendall(pack_message(MSG_DATA, frame))
                             self.frames_to_server += 1
+                            tag = self._classify_frame(frame)
+                            self.proto_to[tag] = self.proto_to.get(tag, 0) + 1
             except OSError:
                 if self.running:
                     log.error('TAP → server relay failed')
@@ -205,6 +244,8 @@ class TunnelClient:
 
                 if msg_type == MSG_DATA and self.tap:
                     self.frames_from_server += 1
+                    tag = self._classify_frame(payload)
+                    self.proto_from[tag] = self.proto_from.get(tag, 0) + 1
                     self.tap.write(payload)
                 elif msg_type == MSG_PING:
                     # Another peer is pinging us — reply with PONG if 'to' matches our IP
@@ -533,7 +574,12 @@ class TunnelGUI:
         # Diagnostic button (ICMP test)
         self.ping_btn = ttk.Button(main, text='Ping Test (ICMP through tunnel)',
                                    command=self._on_ping_test, state=tk.DISABLED)
-        self.ping_btn.pack(fill=tk.X, pady=(0, 5))
+        self.ping_btn.pack(fill=tk.X, pady=(0, 3))
+
+        # Auto-fix button: applies progressively more aggressive firewall fixes
+        self.autofix_btn = ttk.Button(main, text='Auto-Fix Firewall (run on BOTH peers)',
+                                       command=self._on_autofix, state=tk.DISABLED)
+        self.autofix_btn.pack(fill=tk.X, pady=(0, 5))
 
         # -- Status ----------------------------------------------------------
         self.status_var = tk.StringVar(value='Disconnected')
@@ -678,6 +724,7 @@ class TunnelGUI:
     def _on_connected(self, assigned_ip: str = ''):
         self.disconnect_btn.config(state=tk.NORMAL)
         self.ping_btn.config(state=tk.NORMAL)
+        self.autofix_btn.config(state=tk.NORMAL)
         if assigned_ip:
             self.ip_var.set(assigned_ip)
         self.status_var.set(f'Connected to {self.host_var.get()}:{self.port_var.get()}')
@@ -702,6 +749,7 @@ class TunnelGUI:
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         self.ping_btn.config(state=tk.DISABLED)
+        self.autofix_btn.config(state=tk.DISABLED)
         self.status_var.set('Disconnected')
         self.ip_var.set('(auto-assigned by server)')
         self._update_peers([])
@@ -736,9 +784,11 @@ class TunnelGUI:
             sections = []
             sections.append(f'=== My virtual IP: {my_ip}    TAP: {tap_name} ===')
 
-            # Snapshot frame counters before
+            # Snapshot counters before
             f_to_0 = self.client.frames_to_server
             f_from_0 = self.client.frames_from_server
+            proto_to_0 = dict(self.client.proto_to)
+            proto_from_0 = dict(self.client.proto_from)
 
             # ICMP ping each peer (with -S to force source = our virtual IP)
             sections.append('\n=== ICMP PING (raw output) ===')
@@ -764,17 +814,56 @@ class TunnelGUI:
             # Frame counter delta during the ping
             f_to_d = self.client.frames_to_server - f_to_0
             f_from_d = self.client.frames_from_server - f_from_0
+
+            def proto_delta(now: dict, before: dict) -> str:
+                keys = set(now) | set(before)
+                parts = []
+                for k in sorted(keys):
+                    d = now.get(k, 0) - before.get(k, 0)
+                    if d:
+                        parts.append(f'{k}={d}')
+                return ', '.join(parts) if parts else '(none)'
+
+            ptd = proto_delta(self.client.proto_to, proto_to_0)
+            pfd = proto_delta(self.client.proto_from, proto_from_0)
+
+            # Definitive interpretation based on per-protocol counters
+            sent_echo_req = (self.client.proto_to.get('icmp_echo_req', 0)
+                             - proto_to_0.get('icmp_echo_req', 0))
+            recv_echo_req = (self.client.proto_from.get('icmp_echo_req', 0)
+                             - proto_from_0.get('icmp_echo_req', 0))
+            recv_echo_reply = (self.client.proto_from.get('icmp_echo_reply', 0)
+                               - proto_from_0.get('icmp_echo_reply', 0))
+
+            verdict = ''
+            if sent_echo_req == 0:
+                verdict = ('!! ROOT CAUSE: Windows is not transmitting ICMP echo to TAP.\n'
+                           '   Check route table, ensure ping uses -S <virtual-ip>, or TAP '
+                           'media-status is disconnected.')
+            elif recv_echo_reply > 0:
+                verdict = ('OK at tunnel level: %d replies came back. If ping still says '
+                           'timed out, OUR Windows is dropping the reply (very rare).' % recv_echo_reply)
+            elif sent_echo_req > 0 and recv_echo_req == 0:
+                verdict = ('!! ROOT CAUSE: Echo requests reached the relay (we sent %d) but '
+                           'no echo replies came back through the tunnel.\n'
+                           '   This means the OTHER peer\'s Windows received the echo but '
+                           'silently dropped it (firewall/stealth-mode), so it never '
+                           'generated a reply.\n'
+                           '   Fix: on the OTHER peer, run as admin:\n'
+                           '     netsh advfirewall firewall add rule name="AllowAllICMPv4" '
+                           'protocol=icmpv4:any,any dir=in action=allow profile=any\n'
+                           '   Or click "Auto-Fix Firewall" in this app on the OTHER peer.'
+                           % sent_echo_req)
+            else:
+                verdict = ('Mixed: sent %d echo requests, received %d echo requests from peer, '
+                           '%d echo replies. Inconclusive.'
+                           % (sent_echo_req, recv_echo_req, recv_echo_reply))
+
             sections.append(
                 f'\n=== Tunnel frame activity during ping ===\n'
-                f'  TAP -> server: {f_to_d} frames sent\n'
-                f'  server -> TAP: {f_from_d} frames received\n'
-                f'  Interpretation:\n'
-                f'    - {f_to_d}=0  : ICMP echo never reached the TAP read side '
-                f'(Windows did not transmit; route or admin issue)\n'
-                f'    - {f_to_d}>0, {f_from_d}=0  : we sent but peer never replied '
-                f'(peer firewall blocking, or peer not connected)\n'
-                f'    - both >0   : tunnel works; reply was dropped at our side '
-                f'(should have shown Reply from)'
+                f'  TAP -> server: {f_to_d} frames total ({ptd})\n'
+                f'  server -> TAP: {f_from_d} frames total ({pfd})\n'
+                f'\n  VERDICT:\n  {verdict}'
             )
 
             # ARP table - did we learn the peer's MAC?
@@ -852,6 +941,115 @@ class TunnelGUI:
             self.root.after(0, show)
 
         threading.Thread(target=do_ping, daemon=True).start()
+
+    def _on_autofix(self):
+        """Apply progressively aggressive firewall fixes, retest after each step."""
+        if not self.client or not self.client.tap:
+            messagebox.showinfo('Auto-Fix', 'Connect first.')
+            return
+        peers = [p for p in (self.client._known_peers or [])
+                 if p.get('ip') and p.get('ip') != self.client._ip_addr]
+        if not peers:
+            messagebox.showinfo('Auto-Fix', 'No other peers to ping.')
+            return
+
+        target_ip = peers[0]['ip']
+        my_ip = self.client._ip_addr
+        tap_name = self.client.tap.name
+        self.autofix_btn.config(state=tk.DISABLED, text='Auto-fixing...')
+
+        def worker():
+            import subprocess
+            cflags = 0x08000000 if sys.platform == 'win32' else 0
+
+            def sh(cmd):
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=15, creationflags=cflags)
+                    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+                except Exception as e:
+                    return False, str(e)
+
+            def can_ping():
+                ok, out = sh(['ping', '-n', '2', '-w', '1500', '-S', my_ip, target_ip])
+                return 'Reply from ' + target_ip in out
+
+            log_lines = []
+
+            def step(label, *cmds):
+                log_lines.append(f'\n[STEP] {label}')
+                for c in cmds:
+                    ok, out = sh(c)
+                    log_lines.append(f'  $ {" ".join(c)}\n  -> {"OK" if ok else "FAIL"}: '
+                                     f'{out.strip()[:200]}')
+                time.sleep(2)
+                worked = can_ping()
+                log_lines.append(f'  ping after step: {"SUCCESS" if worked else "still failing"}')
+                return worked
+
+            # Step 0: baseline
+            log_lines.append(f'Baseline ping {my_ip} -> {target_ip}: '
+                             f'{"OK" if can_ping() else "fail"}')
+
+            steps = [
+                ('Re-set TAP profile to Private', [
+                    'powershell', '-NoProfile', '-Command',
+                    f"Set-NetConnectionProfile -InterfaceAlias '{tap_name}' "
+                    f"-NetworkCategory Private -ErrorAction SilentlyContinue"
+                ]),
+                ('Add wide-open ICMP allow (no remoteip, no profile)', [
+                    'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                    'name=AllowAllICMPv4',
+                ]),
+                ('Add wide-open ICMP allow (no remoteip, no profile) - add', [
+                    'netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                    'name=AllowAllICMPv4',
+                    'protocol=icmpv4:any,any', 'dir=in', 'action=allow',
+                    'profile=any', 'edge=yes',
+                ]),
+                ('Enable all built-in ICMP echo rules (group)', [
+                    'netsh', 'advfirewall', 'firewall', 'set', 'rule',
+                    'group=File and Printer Sharing', 'new', 'enable=Yes',
+                ]),
+                ('Disable Public profile firewall (last resort)', [
+                    'netsh', 'advfirewall', 'set', 'publicprofile', 'state', 'off',
+                ]),
+                ('Disable Private profile firewall (nuclear)', [
+                    'netsh', 'advfirewall', 'set', 'privateprofile', 'state', 'off',
+                ]),
+            ]
+
+            success_at = None
+            for i, (label, cmd) in enumerate(steps, 1):
+                if step(f'{i}. {label}', cmd):
+                    success_at = label
+                    break
+
+            full_log = '\n'.join(log_lines)
+            log.info('===== AUTO-FIX LOG =====\n%s\n=====', full_log)
+
+            if success_at:
+                msg = (f'SUCCESS at step: {success_at}\n\n'
+                       f'Ping {my_ip} -> {target_ip} now works!\n\n'
+                       'Note: if the successful step disabled a firewall profile, '
+                       're-enable it from Windows Security after your gaming session:\n'
+                       '  netsh advfirewall set allprofiles state on')
+            else:
+                msg = (f'FAILED. Even with firewall disabled, ping still does not work.\n\n'
+                       'This means the issue is NOT firewall on this machine. Possible causes:\n'
+                       '  1. The OTHER peer\'s firewall is blocking (run Auto-Fix on it too)\n'
+                       '  2. AV / endpoint protection silently dropping ICMP\n'
+                       '  3. TAP driver issue (try reinstalling TAP-Windows)\n\n'
+                       'Re-enable firewall:\n  netsh advfirewall set allprofiles state on\n\n'
+                       f'Full log:\n{full_log}')
+
+            def show():
+                self.autofix_btn.config(state=tk.NORMAL,
+                                         text='Auto-Fix Firewall (run on BOTH peers)')
+                messagebox.showinfo('Auto-Fix Result', msg)
+            self.root.after(0, show)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_close(self):
         def do_close():
