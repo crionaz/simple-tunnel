@@ -707,7 +707,7 @@ class TunnelGUI:
         self._update_peers([])
 
     def _on_ping_test(self):
-        """Run a real ICMP ping to each peer via the tunnel and show results."""
+        """Run a real ICMP ping + comprehensive diagnostics."""
         if not self.client or not self.client._known_peers:
             messagebox.showinfo('Ping Test', 'No peers to ping yet.')
             return
@@ -717,43 +717,138 @@ class TunnelGUI:
             messagebox.showinfo('Ping Test', 'No other peers connected.')
             return
 
-        self.ping_btn.config(state=tk.DISABLED, text='Pinging...')
+        my_ip = self.client._ip_addr
+        tap_name = self.client.tap.name if self.client.tap else ''
+        self.ping_btn.config(state=tk.DISABLED, text='Pinging + diagnostics...')
 
         def do_ping():
-            results = []
             import subprocess
+            cflags = 0x08000000 if sys.platform == 'win32' else 0  # CREATE_NO_WINDOW
+
+            def run(cmd, timeout=10):
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=timeout, creationflags=cflags)
+                    return (r.stdout or '') + (('\n[stderr] ' + r.stderr) if r.stderr else '')
+                except Exception as e:
+                    return f'<error: {e}>'
+
+            sections = []
+            sections.append(f'=== My virtual IP: {my_ip}    TAP: {tap_name} ===')
+
+            # Snapshot frame counters before
+            f_to_0 = self.client.frames_to_server
+            f_from_0 = self.client.frames_from_server
+
+            # ICMP ping each peer (with -S to force source = our virtual IP)
+            sections.append('\n=== ICMP PING (raw output) ===')
+            short_results = []
             for p in peers:
                 ip = p['ip']
                 name = p.get('name', '?')
-                try:
-                    out = subprocess.run(
-                        ['ping', '-n', '3', '-w', '2000', ip],
-                        capture_output=True, text=True, timeout=15,
-                        creationflags=0x08000000 if sys.platform == 'win32' else 0,
-                    )
-                    text = out.stdout
-                    if 'Reply from' in text or 'bytes from' in text:
-                        rtt_line = ''
-                        for line in text.splitlines():
-                            if 'Average' in line or 'avg' in line:
-                                rtt_line = line.strip()
-                                break
-                        results.append(f'OK  {ip} ({name})  {rtt_line}')
-                    else:
-                        results.append(f'X   {ip} ({name})  no reply')
-                except Exception as e:
-                    results.append(f'X   {ip} ({name})  error: {e}')
+                cmd = ['ping', '-n', '4', '-w', '2000']
+                if my_ip:
+                    cmd += ['-S', my_ip]
+                cmd.append(ip)
+                out = run(cmd, timeout=20)
+                sections.append(f'\n--- ping {ip} ({name}) ---\n{out}')
+                if 'Reply from ' + ip in out or f'bytes from {ip}' in out:
+                    short_results.append(f'OK  {ip} ({name})')
+                elif 'Destination host unreachable' in out or 'unreachable' in out.lower():
+                    short_results.append(f'X   {ip} ({name})  unreachable (no route/ARP)')
+                elif 'timed out' in out.lower():
+                    short_results.append(f'X   {ip} ({name})  timed out (firewall/relay)')
+                else:
+                    short_results.append(f'X   {ip} ({name})  failed')
 
-            msg = 'ICMP ping results (through tunnel):\n\n' + '\n'.join(results)
-            msg += ('\n\nIf this fails but app-level RTT works in the peer list,\n'
-                    'the issue is Windows Firewall on the OTHER peer.\n'
-                    'On that machine, set the TAP adapter network to Private,\n'
-                    'or run (as admin):\n'
-                    '  netsh advfirewall set publicprofile state off')
+            # Frame counter delta during the ping
+            f_to_d = self.client.frames_to_server - f_to_0
+            f_from_d = self.client.frames_from_server - f_from_0
+            sections.append(
+                f'\n=== Tunnel frame activity during ping ===\n'
+                f'  TAP -> server: {f_to_d} frames sent\n'
+                f'  server -> TAP: {f_from_d} frames received\n'
+                f'  Interpretation:\n'
+                f'    - {f_to_d}=0  : ICMP echo never reached the TAP read side '
+                f'(Windows did not transmit; route or admin issue)\n'
+                f'    - {f_to_d}>0, {f_from_d}=0  : we sent but peer never replied '
+                f'(peer firewall blocking, or peer not connected)\n'
+                f'    - both >0   : tunnel works; reply was dropped at our side '
+                f'(should have shown Reply from)'
+            )
+
+            # ARP table - did we learn the peer's MAC?
+            sections.append('\n=== ARP table for virtual subnet ===')
+            arp = run(['arp', '-a'])
+            for line in arp.splitlines():
+                if '10.10.0.' in line or 'Interface:' in line:
+                    sections.append('  ' + line.strip())
+
+            # Route table for our subnet
+            sections.append('\n=== Routes for 10.10.0.0/24 ===')
+            routes = run(['route', 'print', '10.10.0.*'])
+            for line in routes.splitlines():
+                if '10.10.0' in line or 'Network Destination' in line:
+                    sections.append('  ' + line.strip())
+
+            # TAP adapter status
+            sections.append('\n=== TAP adapter status ===')
+            if tap_name:
+                sections.append(run(
+                    ['netsh', 'interface', 'ip', 'show', 'addresses',
+                     f'name={tap_name}']))
+
+            # Network profile of TAP
+            sections.append('\n=== Network profile (must be Private) ===')
+            sections.append(run(['powershell', '-NoProfile', '-Command',
+                                  'Get-NetConnectionProfile | Format-List Name,InterfaceAlias,NetworkCategory']))
+
+            # Firewall global state
+            sections.append('\n=== Windows Firewall profile state ===')
+            sections.append(run(['netsh', 'advfirewall', 'show', 'allprofiles', 'state']))
+
+            # Our firewall rules
+            sections.append('\n=== Our firewall rules (LAN Game Tunnel*) ===')
+            sections.append(run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                                  'name=LAN Game Tunnel']))
+            sections.append(run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                                  'name=LAN Game Tunnel ICMP']))
+
+            # Built-in ICMP echo rule status
+            sections.append('\n=== Built-in ICMPv4 Echo Request rule ===')
+            sections.append(run(['powershell', '-NoProfile', '-Command',
+                                  '(Get-NetFirewallRule -DisplayName "*Echo Request - ICMPv4-In*" '
+                                  '-ErrorAction SilentlyContinue) | Format-Table DisplayName,Enabled,Profile,Action -AutoSize | Out-String']))
+
+            full_report = '\n'.join(sections)
+
+            # Also log to console for the user / for us to debug
+            log.info('===== PING DIAGNOSTICS =====\n%s\n===== END =====', full_report)
+
+            # Try to save to a file next to the executable for easy sharing
+            try:
+                import tempfile, os, time as _t
+                report_path = os.path.join(tempfile.gettempdir(),
+                                            f'lan-tunnel-diag-{int(_t.time())}.txt')
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(full_report)
+            except OSError:
+                report_path = ''
+
+            summary = ('Ping summary:\n  ' + '\n  '.join(short_results) +
+                       f'\n\nFull diagnostic report saved to:\n  {report_path}\n\n'
+                       'Click "Show details" / scroll the log window in the app for full output.\n'
+                       'Send the diagnostic file if you need help.')
 
             def show():
                 self.ping_btn.config(state=tk.NORMAL, text='Ping Test (ICMP through tunnel)')
-                messagebox.showinfo('Ping Test', msg)
+                # Show short summary in messagebox + open the diag file
+                messagebox.showinfo('Ping Test', summary)
+                if report_path and sys.platform == 'win32':
+                    try:
+                        os.startfile(report_path)  # opens in Notepad
+                    except OSError:
+                        pass
             self.root.after(0, show)
 
         threading.Thread(target=do_ping, daemon=True).start()
