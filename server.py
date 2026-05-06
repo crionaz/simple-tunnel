@@ -106,7 +106,6 @@ class TunnelServer:
         self.clients: dict[int, asyncio.StreamWriter] = {}
         self.client_names: dict[int, str] = {}
         self.client_ips: dict[int, str] = {}  # virtual IPs
-        self.client_macs: dict[int, str] = {}  # TAP MAC addresses
         self.client_frames: dict[int, int] = {}  # data frames received per client
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -141,11 +140,9 @@ class TunnelServer:
                         info = json.loads(payload)
                         name = info.get('name', str(addr))
                         preferred = info.get('ip', '')
-                        mac = info.get('mac', '')
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         name = payload.decode('utf-8', errors='replace')
                         preferred = ''
-                        mac = ''
 
                     # Always assign an IP server-side. Honor the preferred
                     # one (e.g. on reconnect) if it's still free.
@@ -168,7 +165,6 @@ class TunnelServer:
                         stale_writer = self.clients.pop(stale_cid, None)
                         self.client_names.pop(stale_cid, None)
                         self.client_ips.pop(stale_cid, None)
-                        self.client_macs.pop(stale_cid, None)
                         self.client_frames.pop(stale_cid, None)
                         if stale_writer is not None:
                             try:
@@ -178,7 +174,6 @@ class TunnelServer:
 
                     self.client_names[cid] = name
                     self.client_ips[cid] = assigned
-                    self.client_macs[cid] = mac
                     log.info('Client %s identified as "%s" (assigned IP: %s)', addr, name, assigned)
 
                     # Tell client which IP it got
@@ -201,7 +196,6 @@ class TunnelServer:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
             self.client_ips.pop(cid, None)
-            self.client_macs.pop(cid, None)
             self.client_frames.pop(cid, None)
             try:
                 writer.close()
@@ -276,7 +270,6 @@ class TunnelServer:
             peers.append({
                 'name': self.client_names.get(cid, '?'),
                 'ip': ip,
-                'mac': self.client_macs.get(cid, ''),
             })
         msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))
         try:
@@ -299,7 +292,6 @@ class TunnelServer:
             peers.append({
                 'name': self.client_names.get(cid, '?'),
                 'ip': ip,
-                'mac': self.client_macs.get(cid, ''),
             })
         log.info('Connected peers: %d', len(peers))
         msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))
@@ -314,7 +306,6 @@ class TunnelServer:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
             self.client_ips.pop(cid, None)
-            self.client_macs.pop(cid, None)
 
     async def start(self, certfile: str = None, keyfile: str = None):
         self._ssl_ctx = None

@@ -8,19 +8,23 @@ Works with games like **Age of Empires 2/3/4**, **Warcraft 3**, **Starcraft 2**,
 
 ```
 Player A                    Server                    Player B
-┌──────────┐    TCP/TLS     ┌──────────┐    TCP/TLS   ┌──────────┐
-│ Game     │◄──►│ TAP  │◄──►│  Relay   │◄──►│ TAP  │◄──►│ Game     │
-│          │    │Adapter│    │  Server  │    │Adapter│    │          │
-└──────────┘    └──────┘    └──────────┘    └──────┘    └──────────┘
+┌──────────┐   TCP/TLS    ┌──────────┐   TCP/TLS    ┌──────────┐
+│ Game     │◄►│Wintun│◄──►│  Relay   │◄──►│Wintun│◄►│ Game     │
+└──────────┘  └──────┘    └──────────┘    └──────┘  └──────────┘
 ```
 
-Each client gets a virtual TAP network adapter. Ethernet frames are captured and forwarded through the relay server to all other clients, making everyone appear on the same LAN.
+Each client gets a virtual **Wintun** L3 network adapter (the same driver
+WireGuard uses). Raw IP packets are captured and forwarded through the
+relay server to all other clients, making everyone appear on the same LAN.
+
+No ARP, no MAC layer, no driver install ceremony — `wintun.dll` is bundled
+inside the executable.
 
 ## Requirements
 
-- **Windows** (client)
-- **Python 3.10+**
-- **TAP-Windows driver** (from OpenVPN) — run `install_tap.bat` for instructions
+- **Windows 10 / 11** (client)
+- **Python 3.10+** (only if running from source)
+- **Run as Administrator** (needed to create the virtual adapter)
 
 ## Quick Start
 
@@ -30,9 +34,11 @@ Each client gets a virtual TAP network adapter. Ethernet frames are captured and
 pip install -r requirements.txt
 ```
 
-### 2. Install TAP driver (clients only)
+### 2. Wintun (auto-bundled)
 
-Run `install_tap.bat` or install [OpenVPN](https://openvpn.net/community-downloads/) (which includes the TAP driver).
+Nothing to install — `wintun.dll` is downloaded by the GitHub Actions
+build and bundled into the executable. If running from source, place
+`wintun.dll` (amd64, from <https://www.wintun.net/>) next to `client.py`.
 
 ### 3. Start the server
 

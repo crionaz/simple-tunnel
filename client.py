@@ -21,7 +21,7 @@ from protocol import (
     MSG_PING, MSG_PONG,
     pack_message, unpack_header,
 )
-from tap_adapter import TAPAdapter
+from wintun_adapter import WintunAdapter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +42,7 @@ class TunnelClient:
 
     def __init__(self, on_status=None, on_peers=None):
         self.sock: socket.socket | None = None
-        self.tap: TAPAdapter | None = None
+        self.tap: WintunAdapter | None = None
         self.running = False
         self._threads: list[threading.Thread] = []
         self._on_status = on_status  # callback(str)
@@ -63,13 +63,14 @@ class TunnelClient:
         # Frame counters
         self.frames_to_server = 0
         self.frames_from_server = 0
-        # Per-protocol frame counters (parsed from Ethernet header)
-        # Keys: 'arp', 'icmp_echo_req', 'icmp_echo_reply', 'icmp_other',
+        # Per-protocol packet counters (parsed from IP header — Wintun is L3,
+        # so no Ethernet/ARP layer to worry about).
+        # Keys: 'icmp_echo_req', 'icmp_echo_reply', 'icmp_other',
         #       'tcp', 'udp', 'ipv6', 'other'
         self.proto_to: dict[str, int] = {}
         self.proto_from: dict[str, int] = {}
 
-    def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False, mac: str = '') -> str:
+    def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False) -> str:
         """Connect to the relay server, send HELLO, return the assigned virtual IP."""
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -97,7 +98,7 @@ class TunnelClient:
             self.sock.connect((host, port))
 
         self._connected_at = time.monotonic()
-        hello = json.dumps({'name': name, 'ip': preferred_ip, 'mac': mac}).encode('utf-8')
+        hello = json.dumps({'name': name, 'ip': preferred_ip}).encode('utf-8')
         self.sock.sendall(pack_message(MSG_HELLO, hello))
 
         # Wait for server to respond with assigned IP (or error)
@@ -181,26 +182,20 @@ class TunnelClient:
         return False
 
     @staticmethod
-    def _classify_frame(frame: bytes) -> str:
-        """Return short protocol tag for an Ethernet frame."""
-        if len(frame) < 14:
+    def _classify_frame(pkt: bytes) -> str:
+        """Return short protocol tag for a raw IP packet (Wintun is L3)."""
+        if len(pkt) < 1:
             return 'other'
-        ethertype = (frame[12] << 8) | frame[13]
-        if ethertype == 0x0806:
-            return 'arp'
-        if ethertype == 0x86DD:
+        ver = pkt[0] >> 4
+        if ver == 6:
             return 'ipv6'
-        if ethertype != 0x0800:
+        if ver != 4 or len(pkt) < 20:
             return 'other'
-        # IPv4
-        if len(frame) < 14 + 20:
-            return 'other'
-        ip_proto = frame[14 + 9]
+        ip_proto = pkt[9]
         if ip_proto == 1:  # ICMP
-            ihl = (frame[14] & 0x0F) * 4
-            icmp_off = 14 + ihl
-            if len(frame) > icmp_off:
-                t = frame[icmp_off]
+            ihl = (pkt[0] & 0x0F) * 4
+            if len(pkt) > ihl:
+                t = pkt[ihl]
                 if t == 8:
                     return 'icmp_echo_req'
                 if t == 0:
@@ -286,15 +281,6 @@ class TunnelClient:
                         for ip in list(self.peer_rtt.keys()):
                             if ip not in current_ips:
                                 self.peer_rtt.pop(ip, None)
-                        # ** KEY FIX **: install peer MACs as static ARP neighbors
-                        # so we never need to rely on broadcast ARP working.
-                        if self.tap:
-                            other_peers = [p for p in peers
-                                           if p.get('ip') and p.get('ip') != self._ip_addr]
-                            try:
-                                self.tap.install_static_neighbors(other_peers)
-                            except Exception:
-                                log.exception('install_static_neighbors failed')
                         if self._on_peers:
                             self._on_peers(peers)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -357,18 +343,15 @@ class TunnelClient:
         self._use_tls = use_tls
         self._reconnect_count = 0
 
-        # Open TAP FIRST so we know our MAC address (needed for HELLO so server
-        # can publish it to peers, who install it as a static ARP neighbor).
-        self.tap = TAPAdapter()
+        # Open Wintun adapter. No MAC needed (L3 driver — point-to-point).
+        self.tap = WintunAdapter()
         self.tap.open()
-        my_mac = self.tap.get_mac()
-        log.info('TAP MAC: %s', my_mac)
 
         # Connect and get assigned IP from server
-        assigned_ip = self.connect(host, port, name, preferred_ip, use_tls, mac=my_mac)
+        assigned_ip = self.connect(host, port, name, preferred_ip, use_tls)
         self._ip_addr = assigned_ip
 
-        # Configure the IP on the (already-open) TAP
+        # Configure the IP on the (already-open) Wintun adapter
         self.tap.configure_ip(assigned_ip)
 
         self.running = True
@@ -931,11 +914,10 @@ class TunnelGUI:
             sections.append(run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
                                  'name=File and Printer Sharing (Echo Request - ICMPv4-In)']))
 
-            # Static ARP neighbors on the TAP (verifies our peer-MAC injection)
+            # Wintun is L3 — no ARP — but show the interface route for sanity
             if self.client and self.client.tap and self.client.tap.name:
-                sections.append('\n=== Static ARP neighbors on TAP ===')
-                sections.append(run(['netsh', 'interface', 'ipv4', 'show', 'neighbors',
-                                     self.client.tap.name]))
+                sections.append('\n=== Wintun adapter info ===')
+                sections.append(run(['netsh', 'interface', 'ipv4', 'show', 'interfaces']))
 
             full_report = '\n'.join(sections)
 

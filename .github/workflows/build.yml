@@ -19,9 +19,18 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
+      - name: Download wintun.dll (amd64)
+        shell: pwsh
+        run: |
+          $url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile wintun.zip
+          Expand-Archive -Path wintun.zip -DestinationPath wintun-extracted -Force
+          Copy-Item -Path wintun-extracted/wintun/bin/amd64/wintun.dll -Destination ./wintun.dll
+          Get-FileHash wintun.dll -Algorithm SHA256
+
       - name: Build executable
         run: |
-          pyinstaller --noconfirm --onefile --noconsole --uac-admin --name LANGameTunnel client.py
+          pyinstaller --noconfirm --onefile --noconsole --uac-admin --name LANGameTunnel --add-binary "wintun.dll;." client.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
