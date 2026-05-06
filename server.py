@@ -144,18 +144,11 @@ class TunnelServer:
                         name = payload.decode('utf-8', errors='replace')
                         preferred = ''
 
-                    # Always assign an IP server-side. Honor the preferred
-                    # one (e.g. on reconnect) if it's still free.
-                    assigned = self._assign_free_ip(preferred, exclude_cid=cid)
-                    if not assigned:
-                        err = json.dumps({'error': 'Server full: no free virtual IPs'}).encode()
-                        writer.write(pack_message(MSG_INFO, err))
-                        await writer.drain()
-                        log.warning('Rejected %s: no free IPs', addr)
-                        break
-
-                    # Kick any prior session with the same name (handles silent
-                    # reconnects where the old TCP socket is still half-open).
+                    # **IMPORTANT**: kick any prior session with the same name
+                    # FIRST, BEFORE assigning an IP. Otherwise the old session
+                    # still owns the preferred IP, _is_ip_taken() returns True,
+                    # and the reconnecting client gets a DIFFERENT IP — which
+                    # breaks every other peer's view of where this client lives.
                     stale_cids = [
                         other_cid for other_cid, other_name in self.client_names.items()
                         if other_cid != cid and other_name == name
@@ -171,6 +164,17 @@ class TunnelServer:
                                 stale_writer.close()
                             except OSError:
                                 pass
+
+                    # Now assign an IP. Honour preferred (e.g. on reconnect)
+                    # if it's still free — it WILL be, since we just kicked
+                    # the previous owner.
+                    assigned = self._assign_free_ip(preferred, exclude_cid=cid)
+                    if not assigned:
+                        err = json.dumps({'error': 'Server full: no free virtual IPs'}).encode()
+                        writer.write(pack_message(MSG_INFO, err))
+                        await writer.drain()
+                        log.warning('Rejected %s: no free IPs', addr)
+                        break
 
                     self.client_names[cid] = name
                     self.client_ips[cid] = assigned
@@ -346,10 +350,13 @@ class TunnelServer:
         """Peek first byte to decide TLS vs plain, then hand off to handle_client."""
         addr = writer.get_extra_info('peername')
 
-        # Enable TCP keepalive so dead clients are detected within ~45s
+        # Enable TCP keepalive so dead clients are detected within ~45s,
+        # and TCP_NODELAY (disable Nagle) so small game packets are forwarded
+        # immediately instead of being held up to 200ms each.
         sock = writer.get_extra_info('socket')
         if sock is not None:
             try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 # Linux-specific tuning
                 if hasattr(socket, 'TCP_KEEPIDLE'):
