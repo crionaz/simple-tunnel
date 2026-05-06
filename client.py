@@ -57,8 +57,8 @@ class TunnelClient:
         self._lock = threading.Lock()
         self._connected_at: float = 0  # time.monotonic() of last connect
         self._on_error = None          # callback(str) for fatal errors
-        # Peer ping bookkeeping: { peer_ip: rtt_ms (or None) }
-        self.peer_rtt: dict[str, float | None] = {}
+        # Peer ping bookkeeping: { peer_ip: (rtt_ms, recorded_at_monotonic) }
+        self.peer_rtt: dict[str, tuple[float, float]] = {}
         self._known_peers: list[dict] = []
         # Frame counters
         self.frames_to_server = 0
@@ -265,11 +265,16 @@ class TunnelClient:
                             sent = info.get('ts', 0)
                             rtt = (time.monotonic() - sent) * 1000
                             peer_ip = info.get('to', '')
-                            self.peer_rtt[peer_ip] = rtt
-                            log.info('PONG from %s: %.1f ms', peer_ip, rtt)
-                            # Re-render peers with new RTT
-                            if self._on_peers and self._known_peers:
-                                self._on_peers(self._known_peers)
+                            # Discard nonsense RTTs (negative, huge, or stale)
+                            if 0 <= rtt < 30000 and peer_ip:
+                                self.peer_rtt[peer_ip] = (rtt, time.monotonic())
+                                log.info('PONG from %s: %.1f ms', peer_ip, rtt)
+                                # Re-render peers with new RTT
+                                if self._on_peers and self._known_peers:
+                                    self._on_peers(self._known_peers)
+                            else:
+                                log.warning('Ignoring stale/bogus PONG: rtt=%.1fms peer=%s',
+                                            rtt, peer_ip)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         pass
                 elif msg_type == MSG_PEERS:
@@ -624,6 +629,7 @@ class TunnelGUI:
         # Snapshot RTT map from the client (if connected)
         rtt_map = self.client.peer_rtt if self.client else {}
         my_ip = self.client._ip_addr if self.client else ''
+        now = time.monotonic()
 
         def _do():
             self.peers_text.config(state=tk.NORMAL)
@@ -637,8 +643,11 @@ class TunnelGUI:
                     if ip == my_ip:
                         rtt_str = '   (you)'
                     else:
-                        r = rtt_map.get(ip)
-                        rtt_str = f'{r:5.0f}ms' if r is not None else '   ----'
+                        entry = rtt_map.get(ip)
+                        if entry and (now - entry[1]) < 15:
+                            rtt_str = f'{entry[0]:5.0f}ms'
+                        else:
+                            rtt_str = '   ----'
                     self.peers_text.insert(tk.END, f'  {ip:13s} {rtt_str}  {name}\n')
             self.peers_text.config(state=tk.DISABLED)
         self.root.after(0, _do)

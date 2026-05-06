@@ -154,6 +154,24 @@ class TunnelServer:
                         log.warning('Rejected %s: no free IPs', addr)
                         break
 
+                    # Kick any prior session with the same name (handles silent
+                    # reconnects where the old TCP socket is still half-open).
+                    stale_cids = [
+                        other_cid for other_cid, other_name in self.client_names.items()
+                        if other_cid != cid and other_name == name
+                    ]
+                    for stale_cid in stale_cids:
+                        log.info('Kicking stale session for "%s" (cid=%s)', name, stale_cid)
+                        stale_writer = self.clients.pop(stale_cid, None)
+                        self.client_names.pop(stale_cid, None)
+                        self.client_ips.pop(stale_cid, None)
+                        self.client_frames.pop(stale_cid, None)
+                        if stale_writer is not None:
+                            try:
+                                stale_writer.close()
+                            except OSError:
+                                pass
+
                     self.client_names[cid] = name
                     self.client_ips[cid] = assigned
                     log.info('Client %s identified as "%s" (assigned IP: %s)', addr, name, assigned)
