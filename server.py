@@ -243,12 +243,15 @@ class TunnelServer:
         return ''
 
     async def _send_peers_to(self, writer):
-        """Send current peer list to a single writer."""
+        """Send current peer list to a single writer (only HELLO'd peers)."""
         peers = []
         for cid in self.clients:
+            ip = self.client_ips.get(cid)
+            if not ip:
+                continue
             peers.append({
                 'name': self.client_names.get(cid, '?'),
-                'ip': self.client_ips.get(cid, ''),
+                'ip': ip,
             })
         msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))
         try:
@@ -258,12 +261,19 @@ class TunnelServer:
             pass
 
     async def _broadcast_peers(self):
-        """Send current peer list to all clients."""
+        """Send current peer list to all clients.
+
+        Only include clients that have completed HELLO (i.e. have an assigned IP).
+        Pending TLS handshakes and MSG_QUERY connections are excluded.
+        """
         peers = []
         for cid in self.clients:
+            ip = self.client_ips.get(cid)
+            if not ip:
+                continue
             peers.append({
                 'name': self.client_names.get(cid, '?'),
-                'ip': self.client_ips.get(cid, ''),
+                'ip': ip,
             })
         log.info('Connected peers: %d', len(peers))
         msg = pack_message(MSG_PEERS, json.dumps(peers).encode('utf-8'))

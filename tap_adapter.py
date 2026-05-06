@@ -312,7 +312,16 @@ class TAPAdapter:
 
     @staticmethod
     def _add_firewall_rules(ip: str):
-        """Allow all traffic to/from the virtual subnet so peers can ping each other."""
+        """Allow all traffic to/from the virtual subnet so peers can ping each other.
+
+        Tries multiple layers in order so something works regardless of the user's
+        Windows Firewall profile / GPO settings:
+          1) Custom 'allow any' rules (in+out) scoped to the virtual subnet, all profiles.
+          2) Explicit ICMPv4 echo-request allow rule, all profiles.
+          3) Enable Windows' built-in 'File and Printer Sharing' rule group
+             (which contains the canonical ICMPv4-In Echo Request rule that
+             Public profile stealth-mode otherwise overrides).
+        """
         # Derive subnet from IP: 10.10.0.X -> 10.10.0.0/24
         parts = ip.split('.')
         if len(parts) != 4:
@@ -327,6 +336,10 @@ class TAPAdapter:
                 ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={r}'],
                 capture_output=True,
             )
+
+        applied = []
+
+        # Layer 1: blanket allow on the virtual subnet, all profiles
         for direction in ('in', 'out'):
             try:
                 subprocess.run(
@@ -336,15 +349,17 @@ class TAPAdapter:
                         f'dir={direction}',
                         'action=allow',
                         'protocol=any',
+                        'profile=any',
                         f'remoteip={subnet}',
                     ],
                     check=True, capture_output=True,
                 )
+                applied.append(f'subnet-{direction}')
             except subprocess.CalledProcessError as e:
                 stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
                 log.warning('Failed to add firewall rule (%s): %s', direction, stderr)
 
-        # Explicit ICMPv4 echo-request allow (covers all profiles)
+        # Layer 2: explicit ICMPv4 echo-request, all profiles
         try:
             subprocess.run(
                 [
@@ -352,12 +367,42 @@ class TAPAdapter:
                     f'name={icmp_rule}',
                     'dir=in', 'action=allow',
                     'protocol=icmpv4:8,any',
-                    f'remoteip={subnet}',
+                    'profile=any',
                 ],
                 check=True, capture_output=True,
             )
+            applied.append('icmp-explicit')
         except subprocess.CalledProcessError as e:
             stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
             log.warning('Failed to add ICMP allow rule: %s', stderr)
 
-        log.info('Firewall rules added for %s', subnet)
+        # Layer 3: enable Windows built-in File and Printer Sharing rule group.
+        # This contains the canonical ICMPv4-In Echo Request rule that often wins
+        # over user-defined rules on Public profile (stealth-mode bypass).
+        try:
+            r = subprocess.run(
+                [
+                    'netsh', 'advfirewall', 'firewall', 'set', 'rule',
+                    'group=File and Printer Sharing', 'new', 'enable=Yes',
+                ],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                applied.append('builtin-fps-group')
+            else:
+                # Try the localized fallback name
+                r2 = subprocess.run(
+                    [
+                        'netsh', 'advfirewall', 'firewall', 'set', 'rule',
+                        'name=File and Printer Sharing (Echo Request - ICMPv4-In)',
+                        'new', 'enable=Yes',
+                    ],
+                    capture_output=True,
+                )
+                if r2.returncode == 0:
+                    applied.append('builtin-icmp-rule')
+        except OSError as e:
+            log.warning('Could not enable built-in ICMP rule: %s', e)
+
+        log.info('Firewall fixes applied [%s] for subnet %s',
+                 ', '.join(applied) if applied else 'none', subnet)
