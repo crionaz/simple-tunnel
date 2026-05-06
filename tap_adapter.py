@@ -307,6 +307,31 @@ class TAPAdapter:
         # blocks ICMP and most inbound traffic on the TAP adapter.
         self._add_firewall_rules(ip)
         self._set_private_profile()
+        self._force_lowest_metric()
+
+    def _force_lowest_metric(self):
+        """Force the TAP interface to have metric=1 so Windows sends limited
+        broadcasts (255.255.255.255) — used by LAN game discovery — through
+        OUR tunnel instead of out the WiFi/Ethernet adapter.
+
+        Without this, AoE/WC3/SC2 lobbies will never see the host because their
+        UDP broadcast goes out WiFi (lower metric by default), not the TAP.
+        """
+        if not self.name:
+            return
+        try:
+            r = subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'set', 'interface',
+                 self.name, 'metric=1'],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0:
+                log.info('Forced TAP metric=1 (LAN broadcast now goes through tunnel)')
+            else:
+                err = (r.stderr or r.stdout or b'').decode('utf-8', errors='replace').strip()
+                log.warning('Could not set metric on "%s": %s', self.name, err)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning('netsh set interface metric failed: %s', e)
 
     def _set_private_profile(self):
         """Set this adapter's network category to Private so Windows allows ICMP/discovery."""
