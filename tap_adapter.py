@@ -289,6 +289,26 @@ class TAPAdapter:
         # Without these, Windows Defender Firewall (esp. on Public profile)
         # blocks ICMP and most inbound traffic on the TAP adapter.
         self._add_firewall_rules(ip)
+        self._set_private_profile()
+
+    def _set_private_profile(self):
+        """Set this adapter's network category to Private so Windows allows ICMP/discovery."""
+        ps_cmd = (
+            f"Set-NetConnectionProfile -InterfaceAlias '{self.name}' "
+            f"-NetworkCategory Private -ErrorAction SilentlyContinue"
+        )
+        try:
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_cmd],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0:
+                log.info('Set TAP network profile to Private')
+            else:
+                err = r.stderr.decode('utf-8', errors='replace').strip()
+                log.warning('Could not set Private profile: %s', err)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning('Set-NetConnectionProfile failed: %s', e)
 
     @staticmethod
     def _add_firewall_rules(ip: str):
@@ -299,12 +319,14 @@ class TAPAdapter:
             return
         subnet = f'{parts[0]}.{parts[1]}.{parts[2]}.0/24'
         rule_name = 'LAN Game Tunnel'
+        icmp_rule = 'LAN Game Tunnel ICMP'
 
-        # Remove any existing rule with this name to avoid duplicates piling up
-        subprocess.run(
-            ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule_name}'],
-            capture_output=True,
-        )
+        # Remove any existing rules to avoid duplicates piling up
+        for r in (rule_name, icmp_rule):
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={r}'],
+                capture_output=True,
+            )
         for direction in ('in', 'out'):
             try:
                 subprocess.run(
@@ -321,4 +343,21 @@ class TAPAdapter:
             except subprocess.CalledProcessError as e:
                 stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
                 log.warning('Failed to add firewall rule (%s): %s', direction, stderr)
+
+        # Explicit ICMPv4 echo-request allow (covers all profiles)
+        try:
+            subprocess.run(
+                [
+                    'netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                    f'name={icmp_rule}',
+                    'dir=in', 'action=allow',
+                    'protocol=icmpv4:8,any',
+                    f'remoteip={subnet}',
+                ],
+                check=True, capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
+            log.warning('Failed to add ICMP allow rule: %s', stderr)
+
         log.info('Firewall rules added for %s', subnet)

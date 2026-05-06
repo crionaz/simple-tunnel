@@ -9,6 +9,8 @@ MSG_INFO = 0x03       # Server info/status (payload: JSON {"error": ...} or {"ok
 MSG_KEEPALIVE = 0x04  # Keepalive
 MSG_PEERS = 0x05      # Peer list broadcast (payload: JSON list of {"name":..,"ip":..})
 MSG_QUERY = 0x06      # Query peer list without joining (server replies MSG_PEERS + closes)
+MSG_PING = 0x07       # App-level ping (payload: JSON {"to": ip, "from": ip, "ts": float})
+MSG_PONG = 0x08       # App-level pong (payload: same JSON, server forwards back)
 
 # Header: 4-byte payload length (big-endian) + 1-byte message type
 HEADER_FMT = '!IB'

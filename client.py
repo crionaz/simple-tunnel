@@ -18,6 +18,7 @@ import logging
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT,
     MSG_DATA, MSG_HELLO, MSG_INFO, MSG_KEEPALIVE, MSG_PEERS, MSG_QUERY,
+    MSG_PING, MSG_PONG,
     pack_message, unpack_header,
 )
 from tap_adapter import TAPAdapter
@@ -56,6 +57,12 @@ class TunnelClient:
         self._lock = threading.Lock()
         self._connected_at: float = 0  # time.monotonic() of last connect
         self._on_error = None          # callback(str) for fatal errors
+        # Peer ping bookkeeping: { peer_ip: rtt_ms (or None) }
+        self.peer_rtt: dict[str, float | None] = {}
+        self._known_peers: list[dict] = []
+        # Frame counters
+        self.frames_to_server = 0
+        self.frames_from_server = 0
 
     def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False) -> str:
         """Connect to the relay server, send HELLO, return the assigned virtual IP."""
@@ -177,6 +184,7 @@ class TunnelClient:
                     with self._lock:
                         if self.sock:
                             self.sock.sendall(pack_message(MSG_DATA, frame))
+                            self.frames_to_server += 1
             except OSError:
                 if self.running:
                     log.error('TAP → server relay failed')
@@ -196,10 +204,42 @@ class TunnelClient:
                 payload = self._recv_exact(length) if length > 0 else b''
 
                 if msg_type == MSG_DATA and self.tap:
+                    self.frames_from_server += 1
                     self.tap.write(payload)
+                elif msg_type == MSG_PING:
+                    # Another peer is pinging us — reply with PONG if 'to' matches our IP
+                    try:
+                        info = json.loads(payload)
+                        if info.get('to') == self._ip_addr:
+                            with self._lock:
+                                if self.sock:
+                                    self.sock.sendall(pack_message(MSG_PONG, payload))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                elif msg_type == MSG_PONG:
+                    # Our ping came back
+                    try:
+                        info = json.loads(payload)
+                        if info.get('from') == self._ip_addr:
+                            sent = info.get('ts', 0)
+                            rtt = (time.monotonic() - sent) * 1000
+                            peer_ip = info.get('to', '')
+                            self.peer_rtt[peer_ip] = rtt
+                            log.info('PONG from %s: %.1f ms', peer_ip, rtt)
+                            # Re-render peers with new RTT
+                            if self._on_peers and self._known_peers:
+                                self._on_peers(self._known_peers)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
                 elif msg_type == MSG_PEERS:
                     try:
                         peers = json.loads(payload)
+                        self._known_peers = peers
+                        # Drop RTT entries for peers no longer present
+                        current_ips = {p.get('ip', '') for p in peers}
+                        for ip in list(self.peer_rtt.keys()):
+                            if ip not in current_ips:
+                                self.peer_rtt.pop(ip, None)
                         if self._on_peers:
                             self._on_peers(peers)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -275,14 +315,55 @@ class TunnelClient:
 
         t1 = threading.Thread(target=self._tap_to_server, daemon=True, name='tap→srv')
         t2 = threading.Thread(target=self._server_to_tap, daemon=True, name='srv→tap')
+        t3 = threading.Thread(target=self._ping_loop, daemon=True, name='ping')
+        t4 = threading.Thread(target=self._stats_loop, daemon=True, name='stats')
         t1.start()
         t2.start()
-        self._threads = [t1, t2]
+        t3.start()
+        t4.start()
+        self._threads = [t1, t2, t3, t4]
         return assigned_ip
+
+    def _ping_loop(self):
+        """Every 5s, send a PING to every known peer to measure RTT."""
+        while self.running:
+            time.sleep(5)
+            if not self.running:
+                break
+            for peer in list(self._known_peers):
+                peer_ip = peer.get('ip', '')
+                if not peer_ip or peer_ip == self._ip_addr:
+                    continue
+                payload = json.dumps({
+                    'from': self._ip_addr,
+                    'to': peer_ip,
+                    'ts': time.monotonic(),
+                }).encode('utf-8')
+                try:
+                    with self._lock:
+                        if self.sock:
+                            self.sock.sendall(pack_message(MSG_PING, payload))
+                except OSError:
+                    pass
+
+    def _stats_loop(self):
+        """Log frame counters every 15s for debugging."""
+        last_to, last_from = 0, 0
+        while self.running:
+            time.sleep(15)
+            if not self.running:
+                break
+            sent = self.frames_to_server - last_to
+            recv = self.frames_from_server - last_from
+            last_to = self.frames_to_server
+            last_from = self.frames_from_server
+            log.info('Frames last 15s: TAP→srv=%d, srv→TAP=%d (totals: %d / %d)',
+                     sent, recv, self.frames_to_server, self.frames_from_server)
 
     def stop(self):
         """Disconnect and clean up."""
         self.running = False
+        # Close socket first so server-bound threads unblock immediately
         self._close_socket()
         if self.tap:
             try:
@@ -290,8 +371,11 @@ class TunnelClient:
             except OSError:
                 pass
             self.tap = None
+        # Threads are daemons; only briefly wait for the I/O ones (not sleep loops)
         for t in self._threads:
-            t.join(timeout=2.0)
+            if t.name in ('ping', 'stats'):
+                continue  # they sleep; just let daemon kill them
+            t.join(timeout=0.5)
         self._threads.clear()
         log.info('Client stopped')
 
@@ -446,6 +530,11 @@ class TunnelGUI:
         self.disconnect_btn = ttk.Button(btn, text='Disconnect', command=self._on_disconnect, state=tk.DISABLED)
         self.disconnect_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
 
+        # Diagnostic button (ICMP test)
+        self.ping_btn = ttk.Button(main, text='Ping Test (ICMP through tunnel)',
+                                   command=self._on_ping_test, state=tk.DISABLED)
+        self.ping_btn.pack(fill=tk.X, pady=(0, 5))
+
         # -- Status ----------------------------------------------------------
         self.status_var = tk.StringVar(value='Disconnected')
         ttk.Label(main, textvariable=self.status_var, style='Status.TLabel').pack(pady=(5, 2))
@@ -486,6 +575,10 @@ class TunnelGUI:
 
     def _update_peers(self, peers: list):
         """Update the peers text box (called from any thread)."""
+        # Snapshot RTT map from the client (if connected)
+        rtt_map = self.client.peer_rtt if self.client else {}
+        my_ip = self.client._ip_addr if self.client else ''
+
         def _do():
             self.peers_text.config(state=tk.NORMAL)
             self.peers_text.delete('1.0', tk.END)
@@ -495,7 +588,12 @@ class TunnelGUI:
                 for p in peers:
                     ip = p.get('ip', '?')
                     name = p.get('name', '?')
-                    self.peers_text.insert(tk.END, f'  {ip:16s} {name}\n')
+                    if ip == my_ip:
+                        rtt_str = '   (you)'
+                    else:
+                        r = rtt_map.get(ip)
+                        rtt_str = f'{r:5.0f}ms' if r is not None else '   ----'
+                    self.peers_text.insert(tk.END, f'  {ip:13s} {rtt_str}  {name}\n')
             self.peers_text.config(state=tk.DISABLED)
         self.root.after(0, _do)
 
@@ -579,6 +677,7 @@ class TunnelGUI:
 
     def _on_connected(self, assigned_ip: str = ''):
         self.disconnect_btn.config(state=tk.NORMAL)
+        self.ping_btn.config(state=tk.NORMAL)
         if assigned_ip:
             self.ip_var.set(assigned_ip)
         self.status_var.set(f'Connected to {self.host_var.get()}:{self.port_var.get()}')
@@ -602,9 +701,62 @@ class TunnelGUI:
     def _reset_ui(self):
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
+        self.ping_btn.config(state=tk.DISABLED)
         self.status_var.set('Disconnected')
         self.ip_var.set('(auto-assigned by server)')
         self._update_peers([])
+
+    def _on_ping_test(self):
+        """Run a real ICMP ping to each peer via the tunnel and show results."""
+        if not self.client or not self.client._known_peers:
+            messagebox.showinfo('Ping Test', 'No peers to ping yet.')
+            return
+        peers = [p for p in self.client._known_peers
+                 if p.get('ip') and p.get('ip') != self.client._ip_addr]
+        if not peers:
+            messagebox.showinfo('Ping Test', 'No other peers connected.')
+            return
+
+        self.ping_btn.config(state=tk.DISABLED, text='Pinging...')
+
+        def do_ping():
+            results = []
+            import subprocess
+            for p in peers:
+                ip = p['ip']
+                name = p.get('name', '?')
+                try:
+                    out = subprocess.run(
+                        ['ping', '-n', '3', '-w', '2000', ip],
+                        capture_output=True, text=True, timeout=15,
+                        creationflags=0x08000000 if sys.platform == 'win32' else 0,
+                    )
+                    text = out.stdout
+                    if 'Reply from' in text or 'bytes from' in text:
+                        rtt_line = ''
+                        for line in text.splitlines():
+                            if 'Average' in line or 'avg' in line:
+                                rtt_line = line.strip()
+                                break
+                        results.append(f'OK  {ip} ({name})  {rtt_line}')
+                    else:
+                        results.append(f'X   {ip} ({name})  no reply')
+                except Exception as e:
+                    results.append(f'X   {ip} ({name})  error: {e}')
+
+            msg = 'ICMP ping results (through tunnel):\n\n' + '\n'.join(results)
+            msg += ('\n\nIf this fails but app-level RTT works in the peer list,\n'
+                    'the issue is Windows Firewall on the OTHER peer.\n'
+                    'On that machine, set the TAP adapter network to Private,\n'
+                    'or run (as admin):\n'
+                    '  netsh advfirewall set publicprofile state off')
+
+            def show():
+                self.ping_btn.config(state=tk.NORMAL, text='Ping Test (ICMP through tunnel)')
+                messagebox.showinfo('Ping Test', msg)
+            self.root.after(0, show)
+
+        threading.Thread(target=do_ping, daemon=True).start()
 
     def _on_close(self):
         def do_close():

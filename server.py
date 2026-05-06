@@ -14,6 +14,7 @@ import argparse
 from protocol import (
     HEADER_SIZE, DEFAULT_PORT, MAX_FRAME_SIZE,
     MSG_DATA, MSG_HELLO, MSG_INFO, MSG_KEEPALIVE, MSG_PEERS, MSG_QUERY,
+    MSG_PING, MSG_PONG,
     pack_message, unpack_header,
 )
 
@@ -105,6 +106,7 @@ class TunnelServer:
         self.clients: dict[int, asyncio.StreamWriter] = {}
         self.client_names: dict[int, str] = {}
         self.client_ips: dict[int, str] = {}  # virtual IPs
+        self.client_frames: dict[int, int] = {}  # data frames received per client
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
@@ -126,7 +128,12 @@ class TunnelServer:
                 payload = await reader.readexactly(length) if length > 0 else b''
 
                 if msg_type == MSG_DATA:
+                    self.client_frames[cid] = self.client_frames.get(cid, 0) + 1
                     await self._broadcast(cid, payload)
+                elif msg_type in (MSG_PING, MSG_PONG):
+                    # Relay to all other peers (they filter by 'to' field).
+                    msg = pack_message(msg_type, payload)
+                    await self._send_to_others(cid, msg)
                 elif msg_type == MSG_HELLO:
                     # Support both legacy plain-text and new JSON format
                     try:
@@ -171,6 +178,7 @@ class TunnelServer:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
             self.client_ips.pop(cid, None)
+            self.client_frames.pop(cid, None)
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -182,6 +190,9 @@ class TunnelServer:
     async def _broadcast(self, sender_id: int, frame: bytes):
         """Send an Ethernet frame to all clients except the sender."""
         msg = pack_message(MSG_DATA, frame)
+        await self._send_to_others(sender_id, msg)
+
+    async def _send_to_others(self, sender_id: int, msg: bytes):
         dead = []
         for cid, writer in self.clients.items():
             if cid == sender_id:
@@ -194,6 +205,7 @@ class TunnelServer:
         for cid in dead:
             self.clients.pop(cid, None)
             self.client_names.pop(cid, None)
+            self.client_ips.pop(cid, None)
 
     def _is_ip_taken(self, ip: str, exclude_cid: int = None) -> bool:
         """Check if a virtual IP is already assigned to another client."""
@@ -283,8 +295,24 @@ class TunnelServer:
         addrs = ', '.join(str(s.getsockname()) for s in server.sockets)
         log.info('Server listening on %s', addrs)
 
+        # Background task: log frame stats every 30s if any clients connected
+        asyncio.create_task(self._stats_loop())
+
         async with server:
             await server.serve_forever()
+
+    async def _stats_loop(self):
+        while True:
+            await asyncio.sleep(30)
+            if not self.clients:
+                continue
+            parts = []
+            for cid in self.clients:
+                ip = self.client_ips.get(cid, '?')
+                name = self.client_names.get(cid, '?')
+                frames = self.client_frames.get(cid, 0)
+                parts.append(f'{name}({ip})={frames}')
+            log.info('Frame counters [last 30s window resets on reconnect]: %s', ', '.join(parts))
 
     async def _accept_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Peek first byte to decide TLS vs plain, then hand off to handle_client."""
