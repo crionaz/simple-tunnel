@@ -69,7 +69,7 @@ class TunnelClient:
         self.proto_to: dict[str, int] = {}
         self.proto_from: dict[str, int] = {}
 
-    def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False) -> str:
+    def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False, mac: str = '') -> str:
         """Connect to the relay server, send HELLO, return the assigned virtual IP."""
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -97,7 +97,7 @@ class TunnelClient:
             self.sock.connect((host, port))
 
         self._connected_at = time.monotonic()
-        hello = json.dumps({'name': name, 'ip': preferred_ip}).encode('utf-8')
+        hello = json.dumps({'name': name, 'ip': preferred_ip, 'mac': mac}).encode('utf-8')
         self.sock.sendall(pack_message(MSG_HELLO, hello))
 
         # Wait for server to respond with assigned IP (or error)
@@ -286,6 +286,15 @@ class TunnelClient:
                         for ip in list(self.peer_rtt.keys()):
                             if ip not in current_ips:
                                 self.peer_rtt.pop(ip, None)
+                        # ** KEY FIX **: install peer MACs as static ARP neighbors
+                        # so we never need to rely on broadcast ARP working.
+                        if self.tap:
+                            other_peers = [p for p in peers
+                                           if p.get('ip') and p.get('ip') != self._ip_addr]
+                            try:
+                                self.tap.install_static_neighbors(other_peers)
+                            except Exception:
+                                log.exception('install_static_neighbors failed')
                         if self._on_peers:
                             self._on_peers(peers)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -348,13 +357,18 @@ class TunnelClient:
         self._use_tls = use_tls
         self._reconnect_count = 0
 
-        # Connect and get assigned IP from server FIRST
-        assigned_ip = self.connect(host, port, name, preferred_ip, use_tls)
-        self._ip_addr = assigned_ip
-
-        # Now open TAP with the assigned IP
+        # Open TAP FIRST so we know our MAC address (needed for HELLO so server
+        # can publish it to peers, who install it as a static ARP neighbor).
         self.tap = TAPAdapter()
         self.tap.open()
+        my_mac = self.tap.get_mac()
+        log.info('TAP MAC: %s', my_mac)
+
+        # Connect and get assigned IP from server
+        assigned_ip = self.connect(host, port, name, preferred_ip, use_tls, mac=my_mac)
+        self._ip_addr = assigned_ip
+
+        # Configure the IP on the (already-open) TAP
         self.tap.configure_ip(assigned_ip)
 
         self.running = True
@@ -912,11 +926,16 @@ class TunnelGUI:
             sections.append(run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
                                   'name=LAN Game Tunnel ICMP']))
 
-            # Built-in ICMP echo rule status
+            # Built-in ICMP echo rule status (use fast netsh, not slow PowerShell)
             sections.append('\n=== Built-in ICMPv4 Echo Request rule ===')
-            sections.append(run(['powershell', '-NoProfile', '-Command',
-                                  '(Get-NetFirewallRule -DisplayName "*Echo Request - ICMPv4-In*" '
-                                  '-ErrorAction SilentlyContinue) | Format-Table DisplayName,Enabled,Profile,Action -AutoSize | Out-String']))
+            sections.append(run(['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                                 'name=File and Printer Sharing (Echo Request - ICMPv4-In)']))
+
+            # Static ARP neighbors on the TAP (verifies our peer-MAC injection)
+            if self.client and self.client.tap and self.client.tap.name:
+                sections.append('\n=== Static ARP neighbors on TAP ===')
+                sections.append(run(['netsh', 'interface', 'ipv4', 'show', 'neighbors',
+                                     self.client.tap.name]))
 
             full_report = '\n'.join(sections)
 

@@ -25,6 +25,7 @@ INFINITE = 0xFFFFFFFF
 
 # TAP-Windows IOCTL codes
 # CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, function, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
+TAP_IOCTL_GET_MAC = (0x22 << 16) | (1 << 2)          # 0x220004
 TAP_IOCTL_SET_MEDIA_STATUS = (0x22 << 16) | (6 << 2)  # 0x220018
 
 # Registry paths
@@ -204,6 +205,22 @@ class TAPAdapter:
             None, 0, ctypes.byref(out), None,
         )
         log.info('TAP adapter opened')
+
+    def get_mac(self) -> str:
+        """Read the TAP adapter's MAC address. Returns 'aa:bb:cc:dd:ee:ff'."""
+        if not self.handle:
+            return ''
+        buf = (ctypes.c_ubyte * 6)()
+        out = ctypes.c_uint32(0)
+        ok = kernel32.DeviceIoControl(
+            self.handle, TAP_IOCTL_GET_MAC,
+            None, 0,
+            ctypes.byref(buf), 6,
+            ctypes.byref(out), None,
+        )
+        if not ok or out.value != 6:
+            return ''
+        return ':'.join(f'{b:02x}' for b in buf)
 
     def close(self):
         """Close the TAP adapter."""
@@ -406,3 +423,36 @@ class TAPAdapter:
 
         log.info('Firewall fixes applied [%s] for subnet %s',
                  ', '.join(applied) if applied else 'none', subnet)
+
+    def install_static_neighbors(self, peers: list):
+        """Install static ARP entries for known peers, bypassing ARP entirely.
+
+        peers: list of {'ip': '10.10.0.X', 'mac': 'aa:bb:cc:dd:ee:ff', ...}
+        """
+        if not self.name:
+            return
+        # Wipe existing neighbors on this interface so stale entries don't linger
+        subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'delete', 'neighbors', self.name],
+            capture_output=True, timeout=5,
+        )
+        installed = []
+        for p in peers:
+            ip = p.get('ip', '')
+            mac = p.get('mac', '')
+            if not ip or not mac or len(mac) != 17:
+                continue
+            # netsh wants MAC as aa-bb-cc-dd-ee-ff
+            mac_dash = mac.replace(':', '-').lower()
+            try:
+                r = subprocess.run(
+                    ['netsh', 'interface', 'ipv4', 'add', 'neighbors',
+                     self.name, ip, mac_dash],
+                    capture_output=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    installed.append(f'{ip}->{mac_dash}')
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if installed:
+            log.info('Installed static ARP neighbors: %s', ', '.join(installed))
