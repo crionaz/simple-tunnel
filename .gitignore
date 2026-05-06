@@ -6,3 +6,4 @@ dist/
 *.spec
 tunnel_config.json
 certs/
+lan-tunnel-diag-*.txt
