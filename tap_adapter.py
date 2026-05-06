@@ -222,7 +222,7 @@ class TAPAdapter:
     # -- I/O ----------------------------------------------------------------
 
     def read(self, bufsize: int = 2048) -> bytes:
-        """Read an Ethernet frame (blocking with 2s timeout)."""
+        """Read an Ethernet frame (blocking with 500ms timeout)."""
         buf = ctypes.create_string_buffer(bufsize)
         n = ctypes.c_uint32(0)
         ovlp = OVERLAPPED()
@@ -232,7 +232,7 @@ class TAPAdapter:
         if not ret:
             err = ctypes.get_last_error()
             if err == ERROR_IO_PENDING:
-                wait = kernel32.WaitForSingleObject(ovlp.hEvent, 2000)
+                wait = kernel32.WaitForSingleObject(ovlp.hEvent, 500)
                 if wait != WAIT_OBJECT_0:
                     kernel32.CancelIo(self.handle)
                     return b''
@@ -284,3 +284,41 @@ class TAPAdapter:
                 'Right-click the app and select "Run as Administrator",\n'
                 'or manually set the adapter IP in Network Connections.'
             ) from None
+
+        # Add firewall rules so peers can ping/connect to us.
+        # Without these, Windows Defender Firewall (esp. on Public profile)
+        # blocks ICMP and most inbound traffic on the TAP adapter.
+        self._add_firewall_rules(ip)
+
+    @staticmethod
+    def _add_firewall_rules(ip: str):
+        """Allow all traffic to/from the virtual subnet so peers can ping each other."""
+        # Derive subnet from IP: 10.10.0.X -> 10.10.0.0/24
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return
+        subnet = f'{parts[0]}.{parts[1]}.{parts[2]}.0/24'
+        rule_name = 'LAN Game Tunnel'
+
+        # Remove any existing rule with this name to avoid duplicates piling up
+        subprocess.run(
+            ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule_name}'],
+            capture_output=True,
+        )
+        for direction in ('in', 'out'):
+            try:
+                subprocess.run(
+                    [
+                        'netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                        f'name={rule_name}',
+                        f'dir={direction}',
+                        'action=allow',
+                        'protocol=any',
+                        f'remoteip={subnet}',
+                    ],
+                    check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode('utf-8', errors='replace').strip() if e.stderr else ''
+                log.warning('Failed to add firewall rule (%s): %s', direction, stderr)
+        log.info('Firewall rules added for %s', subnet)

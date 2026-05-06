@@ -6,6 +6,7 @@ Ethernet frames between them, creating a virtual LAN.
 
 import asyncio
 import json
+import socket
 import ssl
 import logging
 import argparse
@@ -131,21 +132,30 @@ class TunnelServer:
                     try:
                         info = json.loads(payload)
                         name = info.get('name', str(addr))
-                        vip = info.get('ip', '')
+                        preferred = info.get('ip', '')
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         name = payload.decode('utf-8', errors='replace')
-                        vip = ''
-                    # Check for duplicate virtual IP
-                    if vip and self._is_ip_taken(vip, exclude_cid=cid):
-                        err = json.dumps({'error': f'IP {vip} is already taken by another player.'}).encode()
+                        preferred = ''
+
+                    # Always assign an IP server-side. Honor the preferred
+                    # one (e.g. on reconnect) if it's still free.
+                    assigned = self._assign_free_ip(preferred, exclude_cid=cid)
+                    if not assigned:
+                        err = json.dumps({'error': 'Server full: no free virtual IPs'}).encode()
                         writer.write(pack_message(MSG_INFO, err))
                         await writer.drain()
-                        log.warning('Rejected %s: duplicate IP %s', addr, vip)
+                        log.warning('Rejected %s: no free IPs', addr)
                         break
+
                     self.client_names[cid] = name
-                    if vip:
-                        self.client_ips[cid] = vip
-                    log.info('Client %s identified as "%s" (IP: %s)', addr, name, vip or 'unknown')
+                    self.client_ips[cid] = assigned
+                    log.info('Client %s identified as "%s" (assigned IP: %s)', addr, name, assigned)
+
+                    # Tell client which IP it got
+                    info_msg = json.dumps({'assigned_ip': assigned}).encode()
+                    writer.write(pack_message(MSG_INFO, info_msg))
+                    await writer.drain()
+
                     await self._broadcast_peers()
                 elif msg_type == MSG_QUERY:
                     # Return peer list without joining
@@ -191,6 +201,34 @@ class TunnelServer:
             if cid != exclude_cid and vip == ip:
                 return True
         return False
+
+    def _assign_free_ip(self, preferred: str = '', exclude_cid: int = None) -> str:
+        """Pick a free virtual IP in 10.10.0.1 - 10.10.0.254. Honor preferred if free."""
+        if preferred and not self._is_ip_taken(preferred, exclude_cid):
+            # Validate format: 10.10.0.X
+            parts = preferred.split('.')
+            if (len(parts) == 4 and parts[0] == '10' and parts[1] == '10'
+                    and parts[2] == '0'):
+                try:
+                    n = int(parts[3])
+                    if 1 <= n <= 254:
+                        return preferred
+                except ValueError:
+                    pass
+        taken = set()
+        for cid, vip in self.client_ips.items():
+            if cid == exclude_cid:
+                continue
+            parts = vip.split('.')
+            if len(parts) == 4:
+                try:
+                    taken.add(int(parts[3]))
+                except ValueError:
+                    pass
+        for i in range(1, 255):
+            if i not in taken:
+                return f'10.10.0.{i}'
+        return ''
 
     async def _send_peers_to(self, writer):
         """Send current peer list to a single writer."""
@@ -251,6 +289,22 @@ class TunnelServer:
     async def _accept_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Peek first byte to decide TLS vs plain, then hand off to handle_client."""
         addr = writer.get_extra_info('peername')
+
+        # Enable TCP keepalive so dead clients are detected within ~45s
+        sock = writer.get_extra_info('socket')
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # Linux-specific tuning
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except OSError:
+                pass
+
         try:
             first = await asyncio.wait_for(reader.read(1), timeout=10)
             if not first:

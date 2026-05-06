@@ -57,11 +57,12 @@ class TunnelClient:
         self._connected_at: float = 0  # time.monotonic() of last connect
         self._on_error = None          # callback(str) for fatal errors
 
-    def connect(self, host: str, port: int, name: str, ip_addr: str, use_tls: bool = False):
-        """Connect to the relay server."""
+    def connect(self, host: str, port: int, name: str, preferred_ip: str, use_tls: bool = False) -> str:
+        """Connect to the relay server, send HELLO, return the assigned virtual IP."""
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        raw.settimeout(5)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        raw.settimeout(10)
 
         if use_tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -83,11 +84,32 @@ class TunnelClient:
             self.sock = raw
             self.sock.connect((host, port))
 
-        self.sock.settimeout(None)
         self._connected_at = time.monotonic()
-        hello = json.dumps({'name': name, 'ip': ip_addr}).encode('utf-8')
+        hello = json.dumps({'name': name, 'ip': preferred_ip}).encode('utf-8')
         self.sock.sendall(pack_message(MSG_HELLO, hello))
-        log.info('Connected to %s:%d', host, port)
+
+        # Wait for server to respond with assigned IP (or error)
+        assigned_ip = self._wait_for_assignment()
+        self.sock.settimeout(None)
+        log.info('Connected to %s:%d, assigned IP %s', host, port, assigned_ip)
+        return assigned_ip
+
+    def _wait_for_assignment(self) -> str:
+        """Read messages until MSG_INFO with assigned_ip arrives. Discard MSG_PEERS."""
+        while True:
+            header = self._recv_exact(HEADER_SIZE)
+            length, msg_type = unpack_header(header)
+            payload = self._recv_exact(length) if length > 0 else b''
+            if msg_type == MSG_INFO:
+                try:
+                    info = json.loads(payload)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if 'error' in info:
+                    raise ConnectionError(info['error'])
+                if 'assigned_ip' in info:
+                    return info['assigned_ip']
+            # Ignore other early messages (peers list, etc.)
 
     def _recv_exact(self, n: int) -> bytes:
         """Read exactly n bytes from the socket."""
@@ -107,6 +129,11 @@ class TunnelClient:
     def _close_socket(self):
         with self._lock:
             if self.sock:
+                # Shutdown first to immediately unblock any blocked recv()
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     self.sock.close()
                 except OSError:
@@ -124,9 +151,17 @@ class TunnelClient:
                 time.sleep(0.1)
             try:
                 self._close_socket()
-                self.connect(self._host, self._port, self._name, self._ip_addr, self._use_tls)
+                assigned = self.connect(self._host, self._port, self._name,
+                                        self._ip_addr, self._use_tls)
+                # Re-configure TAP if server gave us a different IP
+                if assigned and assigned != self._ip_addr and self.tap:
+                    try:
+                        self.tap.configure_ip(assigned)
+                    except Exception:
+                        log.exception('Failed to reconfigure TAP IP')
+                    self._ip_addr = assigned
                 self._reconnect_count = 0
-                self._set_status(f'Reconnected to {self._host}:{self._port}')
+                self._set_status(f'Reconnected ({self._ip_addr})')
                 return True
             except Exception as e:
                 self._reconnect_count += 1
@@ -172,16 +207,17 @@ class TunnelClient:
                 elif msg_type == MSG_INFO:
                     try:
                         info = json.loads(payload)
-                        err_msg = info.get('error', '')
-                        if err_msg:
-                            log.error('Server error: %s', err_msg)
-                            self._set_status('Rejected')
-                            if self._on_error:
-                                self._on_error(err_msg)
-                            self.running = False
-                            break
                     except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+                        info = {}
+                    err_msg = info.get('error', '')
+                    if err_msg:
+                        log.error('Server error: %s', err_msg)
+                        self._set_status('Rejected')
+                        if self._on_error:
+                            self._on_error(err_msg)
+                        self.running = False
+                        break
+                    # Ignore informational messages (e.g. assigned_ip after reconnect)
                 elif msg_type == MSG_KEEPALIVE:
                     pass  # server pong, ignore
             except (ConnectionError, OSError):
@@ -213,22 +249,28 @@ class TunnelClient:
                     log.exception('Server read error')
                 break
 
-    def start(self, host: str, port: int, name: str,
-              ip_addr: str, use_tls: bool = False):
-        """Open TAP adapter, connect to server, start relay threads."""
+    def start(self, host: str, port: int, name: str, use_tls: bool = False,
+              preferred_ip: str = '') -> str:
+        """Connect to server (gets assigned IP), open TAP, start relay threads.
+
+        Returns the assigned virtual IP.
+        """
         # Store params for reconnection
         self._host = host
         self._port = port
         self._name = name
-        self._ip_addr = ip_addr
         self._use_tls = use_tls
         self._reconnect_count = 0
 
+        # Connect and get assigned IP from server FIRST
+        assigned_ip = self.connect(host, port, name, preferred_ip, use_tls)
+        self._ip_addr = assigned_ip
+
+        # Now open TAP with the assigned IP
         self.tap = TAPAdapter()
         self.tap.open()
-        self.tap.configure_ip(ip_addr)
+        self.tap.configure_ip(assigned_ip)
 
-        self.connect(host, port, name, ip_addr, use_tls)
         self.running = True
 
         t1 = threading.Thread(target=self._tap_to_server, daemon=True, name='tap→srv')
@@ -236,6 +278,7 @@ class TunnelClient:
         t1.start()
         t2.start()
         self._threads = [t1, t2]
+        return assigned_ip
 
     def stop(self):
         """Disconnect and clean up."""
@@ -248,7 +291,7 @@ class TunnelClient:
                 pass
             self.tap = None
         for t in self._threads:
-            t.join(timeout=0.5)
+            t.join(timeout=2.0)
         self._threads.clear()
         log.info('Client stopped')
 
@@ -381,8 +424,9 @@ class TunnelGUI:
         net.pack(fill=tk.X, pady=5)
 
         ttk.Label(net, text='Virtual IP:').grid(row=0, column=0, sticky=tk.W, pady=3)
-        self.ip_var = tk.StringVar(value='10.10.0.1')
-        ttk.Entry(net, textvariable=self.ip_var, width=28).grid(row=0, column=1, padx=5, pady=3)
+        self.ip_var = tk.StringVar(value='(auto-assigned by server)')
+        ttk.Label(net, textvariable=self.ip_var, foreground='#0066cc',
+                  font=('Consolas', 10, 'bold')).grid(row=0, column=1, sticky=tk.W, padx=5, pady=3)
 
         self.tls_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(net, text='Use TLS encryption', variable=self.tls_var).grid(
@@ -424,17 +468,17 @@ class TunnelGUI:
             self.port_var.set(str(cfg['port']))
         if cfg.get('name'):
             self.name_var.set(cfg['name'])
-        if cfg.get('ip'):
-            self.ip_var.set(cfg['ip'])
         if cfg.get('tls') is not None:
             self.tls_var.set(cfg['tls'])
+        # Remember last assigned IP as a preference for next connect
+        self._preferred_ip = cfg.get('ip', '')
 
     def _save_current_config(self):
         _save_config({
             'host': self.host_var.get().strip(),
             'port': self.port_var.get().strip(),
             'name': self.name_var.get().strip(),
-            'ip': self.ip_var.get().strip(),
+            'ip': getattr(self, '_preferred_ip', ''),
             'tls': self.tls_var.get(),
         })
 
@@ -475,10 +519,8 @@ class TunnelGUI:
         def do_query():
             try:
                 peers = query_peers(host, port, self.tls_var.get())
-                suggested = _suggest_ip(peers)
                 def update():
                     self._update_peers(peers)
-                    self.ip_var.set(suggested)
                     self.status_var.set(f'{len(peers)} peer(s) online')
                     self.refresh_btn.config(state=tk.NORMAL)
                 self.root.after(0, update)
@@ -495,7 +537,6 @@ class TunnelGUI:
     def _on_connect(self):
         host = self.host_var.get().strip()
         name = self.name_var.get().strip() or 'Player'
-        ip_addr = self.ip_var.get().strip()
 
         try:
             port = int(self.port_var.get().strip())
@@ -506,13 +547,11 @@ class TunnelGUI:
         if not host:
             messagebox.showerror('Error', 'Server address is required')
             return
-        if not ip_addr:
-            messagebox.showerror('Error', 'Virtual IP is required')
-            return
 
         self._save_current_config()
         self.connect_btn.config(state=tk.DISABLED)
         self.status_var.set('Connecting...')
+        self.ip_var.set('(requesting from server...)')
 
         def status_callback(msg: str):
             self.root.after(0, lambda m=msg: self.status_var.set(m))
@@ -526,16 +565,22 @@ class TunnelGUI:
                 self.client._on_error = lambda msg: self.root.after(
                     0, lambda m=msg: self._on_error(m)
                 )
-                self.client.start(host, port, name, ip_addr, self.tls_var.get())
-                self.root.after(0, self._on_connected)
+                preferred = getattr(self, '_preferred_ip', '')
+                assigned = self.client.start(host, port, name,
+                                             self.tls_var.get(), preferred)
+                self._preferred_ip = assigned
+                self._save_current_config()
+                self.root.after(0, lambda: self._on_connected(assigned))
             except Exception as e:
                 err = str(e)
                 self.root.after(0, lambda err=err: self._on_error(err))
 
         threading.Thread(target=do_connect, daemon=True).start()
 
-    def _on_connected(self):
+    def _on_connected(self, assigned_ip: str = ''):
         self.disconnect_btn.config(state=tk.NORMAL)
+        if assigned_ip:
+            self.ip_var.set(assigned_ip)
         self.status_var.set(f'Connected to {self.host_var.get()}:{self.port_var.get()}')
 
     def _on_disconnect(self):
@@ -558,6 +603,7 @@ class TunnelGUI:
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         self.status_var.set('Disconnected')
+        self.ip_var.set('(auto-assigned by server)')
         self._update_peers([])
 
     def _on_close(self):
