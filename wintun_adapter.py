@@ -210,67 +210,104 @@ class WintunAdapter:
         _dll.WintunSendPacket(self._session, ptr)
         return n
 
-    # -- IP / firewall config (uses same netsh approach as TAP) --------
-    def configure_ip(self, ip: str, mask: str = '255.255.255.0'):
-        """Assign a static IP, force lowest metric (so LAN broadcasts go
-        through the tunnel), and add wide-open firewall rules for the subnet."""
-        # 1. Wait for the OS to surface the adapter (Wintun publishes it
-        #    asynchronously after WintunCreateAdapter).
-        for _ in range(20):
-            r = subprocess.run(
-                ['netsh', 'interface', 'ipv4', 'show', 'interfaces'],
-                capture_output=True, timeout=10,
-            )
-            if ADAPTER_NAME.lower() in (r.stdout or b'').decode(
-                    'utf-8', errors='replace').lower():
-                break
-            import time
-            time.sleep(0.25)
+    # -- IP / firewall config -----------------------------------------
+    # The adapter GUID in registry/Get-NetAdapter form (8-4-4-4-12 hex with braces).
+    # First 3 groups are little-endian, last 2 are big-endian.
+    # Bytes: AB 1B 2C 3D 4E 5F 67 89 AB CD EF 01 23 45 67 89
+    _ADAPTER_GUID_STR = '{3D2C1BAB-5F4E-8967-ABCD-EF0123456789}'
 
-        # 2. Set static IP
-        cmd = [
-            'netsh', 'interface', 'ipv4', 'set', 'address',
-            f'name={ADAPTER_NAME}', 'static', ip, mask,
-        ]
-        log.info('Configuring IP: %s/%s on "%s"', ip, mask, ADAPTER_NAME)
+    def configure_ip(self, ip: str, mask: str = '255.255.255.0'):
+        """Assign a static IP, force metric=1 (LAN broadcasts go through the
+        tunnel), and add wide-open firewall rules for the subnet.
+
+        Uses PowerShell + Get-NetAdapter (filtered by GUID) instead of netsh,
+        because:
+          * netsh prints errors to stdout, not stderr (so messages get lost)
+          * netsh requires the localized friendly name, which can vary
+          * PowerShell's *-NetIPAddress cmdlets work with InterfaceIndex,
+            which is unambiguous
+        """
+        prefix = self._mask_to_prefix(mask)
+        guid = self._ADAPTER_GUID_STR
+
+        ps_script = (
+            "$ErrorActionPreference = 'Stop';"
+            f"$guid = '{guid}';"
+            "$adapter = $null;"
+            # Wait up to 10s for the adapter to surface in TCP/IP stack
+            "for ($i=0; $i -lt 40; $i++) {"
+            "  $a = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceGuid -eq $guid };"
+            "  if ($a) { $adapter = $a; break }"
+            "  Start-Sleep -Milliseconds 250"
+            "};"
+            "if (-not $adapter) { throw \"Wintun adapter with GUID $guid not found in Get-NetAdapter output. Is wintun.dll loaded?\" };"
+            "$idx = $adapter.ifIndex;"
+            "$alias = $adapter.Name;"
+            # Bring it up
+            "try { Enable-NetAdapter -InputObject $adapter -Confirm:$false -ErrorAction SilentlyContinue } catch {};"
+            # Wipe old IPs/routes so re-runs work cleanly
+            "Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue;"
+            "Remove-NetRoute -InterfaceIndex $idx -Confirm:$false -ErrorAction SilentlyContinue | Out-Null;"
+            # Assign the static IP
+            f"New-NetIPAddress -InterfaceIndex $idx -IPAddress '{ip}' -PrefixLength {prefix} -ErrorAction Stop | Out-Null;"
+            # Force lowest metric so LAN broadcasts route through the tunnel
+            "Set-NetIPInterface -InterfaceIndex $idx -InterfaceMetric 1 -ErrorAction SilentlyContinue;"
+            # Mark Private profile so Windows Firewall is permissive
+            "try { Set-NetConnectionProfile -InterfaceIndex $idx -NetworkCategory Private -ErrorAction SilentlyContinue } catch {};"
+            "Write-Output \"OK alias=$alias idx=$idx\""
+        )
+
+        log.info('Configuring IP: %s/%d on Wintun adapter (GUID %s)',
+                 ip, prefix, guid)
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=15)
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or b'').decode('utf-8', errors='replace').strip()
-            log.warning('Failed to set IP: %s', stderr)
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                 '-Command', ps_script],
+                capture_output=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
             raise RuntimeError(
-                f'Could not set IP on Wintun adapter.\n\n'
-                f'Run the app as Administrator.\n\nDetail: {stderr}'
+                f'Could not invoke PowerShell to configure Wintun IP: {e}'
             ) from None
 
-        # 3. Force metric=1 so LAN game broadcasts (255.255.255.255) and
-        #    subnet broadcasts (10.10.0.255) route through OUR tunnel
-        #    instead of WiFi/Ethernet.
-        try:
-            subprocess.run(
-                ['netsh', 'interface', 'ipv4', 'set', 'interface',
-                 ADAPTER_NAME, 'metric=1'],
-                capture_output=True, timeout=10,
+        stdout = (r.stdout or b'').decode('utf-8', errors='replace').strip()
+        stderr = (r.stderr or b'').decode('utf-8', errors='replace').strip()
+
+        if r.returncode != 0 or not stdout.startswith('OK'):
+            detail = (stderr or stdout or '(no output)').strip()
+            log.warning('Wintun IP config failed: rc=%s stdout=%r stderr=%r',
+                        r.returncode, stdout, stderr)
+            raise RuntimeError(
+                'Could not set IP on Wintun adapter.\n\n'
+                'Make sure the app is running as Administrator and that '
+                'wintun.dll is bundled correctly.\n\n'
+                f'Detail: {detail}'
             )
-            log.info('Forced Wintun metric=1 (broadcast goes through tunnel)')
-        except (OSError, subprocess.TimeoutExpired):
+
+        log.info('Wintun configured: %s', stdout)
+
+        # Friendly name might have been auto-renamed by Windows; capture it
+        # so diagnostic / firewall code uses the real alias.
+        try:
+            alias_part = [tok for tok in stdout.split() if tok.startswith('alias=')]
+            if alias_part:
+                alias = alias_part[0].split('=', 1)[1]
+                if alias:
+                    self.name = alias
+        except (IndexError, ValueError):
             pass
 
-        # 4. Firewall: blanket allow on the virtual subnet (no ARP/ICMP
-        #    edge-cases possible here — Wintun is L3, no MAC layer).
+        # Firewall: blanket allow on the virtual subnet
         self._add_firewall_rules(ip)
-        self._set_private_profile()
 
-    def _set_private_profile(self):
+    @staticmethod
+    def _mask_to_prefix(mask: str) -> int:
         try:
-            subprocess.run(
-                ['powershell', '-NoProfile', '-Command',
-                 f"Set-NetConnectionProfile -InterfaceAlias '{ADAPTER_NAME}' "
-                 f"-NetworkCategory Private -ErrorAction SilentlyContinue"],
-                capture_output=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            parts = [int(x) for x in mask.split('.')]
+            n = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+            return bin(n).count('1')
+        except (ValueError, IndexError):
+            return 24
 
     @staticmethod
     def _add_firewall_rules(ip: str):
