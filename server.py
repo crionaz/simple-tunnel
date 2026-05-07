@@ -100,6 +100,8 @@ class _TLSWriter:
 
 
 class TunnelServer:
+    DEFAULT_SUBNET = '10.10.0'  # first three octets of the /24 virtual subnet
+
     def __init__(self, host: str = '0.0.0.0', port: int = DEFAULT_PORT):
         self.host = host
         self.port = port
@@ -107,6 +109,9 @@ class TunnelServer:
         self.client_names: dict[int, str] = {}
         self.client_ips: dict[int, str] = {}  # virtual IPs
         self.client_frames: dict[int, int] = {}  # data frames received per client
+        # First three octets of the active /24. Locked while clients are
+        # connected; resets to the next preference when the server is empty.
+        self._active_subnet: str = self.DEFAULT_SUBNET
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
@@ -140,9 +145,11 @@ class TunnelServer:
                         info = json.loads(payload)
                         name = info.get('name', str(addr))
                         preferred = info.get('ip', '')
+                        subnet_pref = info.get('subnet', '')
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         name = payload.decode('utf-8', errors='replace')
                         preferred = ''
+                        subnet_pref = ''
 
                     # **IMPORTANT**: kick any prior session with the same name
                     # FIRST, BEFORE assigning an IP. Otherwise the old session
@@ -168,7 +175,8 @@ class TunnelServer:
                     # Now assign an IP. Honour preferred (e.g. on reconnect)
                     # if it's still free — it WILL be, since we just kicked
                     # the previous owner.
-                    assigned = self._assign_free_ip(preferred, exclude_cid=cid)
+                    assigned = self._assign_free_ip(preferred, subnet_pref,
+                                                    exclude_cid=cid)
                     if not assigned:
                         err = json.dumps({'error': 'Server full: no free virtual IPs'}).encode()
                         writer.write(pack_message(MSG_INFO, err))
@@ -236,33 +244,87 @@ class TunnelServer:
                 return True
         return False
 
-    def _assign_free_ip(self, preferred: str = '', exclude_cid: int = None) -> str:
-        """Pick a free virtual IP in 10.10.0.1 - 10.10.0.254. Honor preferred if free."""
+    def _assign_free_ip(self, preferred: str = '', subnet_pref: str = '',
+                        exclude_cid: int = None) -> str:
+        """Pick a free virtual IP. Honour preferred IP / subnet preference
+        when possible.
+
+        Subnet rules:
+          * If no other clients are connected, the preference (or the /24 of
+            the preferred IP) becomes the active subnet.
+          * Otherwise the active subnet is locked — we ignore the preference
+            and assign from the active subnet so all peers stay reachable.
+        """
+        # Determine other clients' subnets to know if we can switch
+        other_assigned = [vip for cid, vip in self.client_ips.items()
+                          if cid != exclude_cid]
+
+        # Possibly switch the active subnet (only when nobody else is connected)
+        if not other_assigned:
+            new_sub = ''
+            if subnet_pref and self._is_valid_subnet(subnet_pref):
+                new_sub = subnet_pref.rstrip('.')
+            elif preferred:
+                p = preferred.split('.')
+                if len(p) == 4 and all(x.isdigit() for x in p):
+                    cand = '.'.join(p[:3])
+                    if self._is_valid_subnet(cand):
+                        new_sub = cand
+            if new_sub and new_sub != self._active_subnet:
+                log.info('Switching active subnet: %s -> %s',
+                         self._active_subnet, new_sub)
+                self._active_subnet = new_sub
+
+        sub = self._active_subnet
+
+        # Honour preferred exact IP if it's in the active subnet and free
         if preferred and not self._is_ip_taken(preferred, exclude_cid):
-            # Validate format: 10.10.0.X
             parts = preferred.split('.')
-            if (len(parts) == 4 and parts[0] == '10' and parts[1] == '10'
-                    and parts[2] == '0'):
+            if (len(parts) == 4 and '.'.join(parts[:3]) == sub):
                 try:
                     n = int(parts[3])
                     if 1 <= n <= 254:
                         return preferred
                 except ValueError:
                     pass
+
         taken = set()
         for cid, vip in self.client_ips.items():
             if cid == exclude_cid:
                 continue
             parts = vip.split('.')
-            if len(parts) == 4:
+            if len(parts) == 4 and '.'.join(parts[:3]) == sub:
                 try:
                     taken.add(int(parts[3]))
                 except ValueError:
                     pass
         for i in range(1, 255):
             if i not in taken:
-                return f'10.10.0.{i}'
+                return f'{sub}.{i}'
         return ''
+
+    @staticmethod
+    def _is_valid_subnet(s: str) -> bool:
+        """True if s is the first 3 octets of a private IPv4 /24."""
+        parts = s.split('.')
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            return False
+        try:
+            o = [int(p) for p in parts]
+        except ValueError:
+            return False
+        if not all(0 <= x <= 255 for x in o):
+            return False
+        # Restrict to RFC1918-style ranges + 25.x (Hamachi-style)
+        if o[0] == 10:
+            return True
+        if o[0] == 192 and o[1] == 168:
+            return True
+        if o[0] == 172 and 16 <= o[1] <= 31:
+            return True
+        if o[0] == 25:
+            return True
+        return False
 
     async def _send_peers_to(self, writer):
         """Send current peer list to a single writer (only HELLO'd peers)."""

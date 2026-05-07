@@ -21,6 +21,9 @@ import logging
 
 log = logging.getLogger('wintun-adapter')
 
+# Hide all child-process console windows (we are a -noconsole app)
+_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
+
 # Stable GUID for our adapter so it persists across runs (avoids littering
 # Device Manager with new adapters every connect).
 # {AB1B2C3D-4E5F-6789-ABCD-EF0123456789}
@@ -279,6 +282,7 @@ class WintunAdapter:
                 ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
                  '-Command', ps_script],
                 capture_output=True, timeout=30,
+                creationflags=_NO_WINDOW,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             raise RuntimeError(
@@ -334,13 +338,13 @@ class WintunAdapter:
         # Wipe and re-add so changes are clean
         subprocess.run(
             ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule}'],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=10, creationflags=_NO_WINDOW,
         )
         for direction in ('in', 'out'):
             subprocess.run(
                 ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
                  f'name={rule}', f'dir={direction}', 'action=allow',
                  'protocol=any', 'profile=any', f'remoteip={subnet}'],
-                capture_output=True, timeout=10,
+                capture_output=True, timeout=10, creationflags=_NO_WINDOW,
             )
         log.info('Firewall: allow any/any on %s', subnet)
